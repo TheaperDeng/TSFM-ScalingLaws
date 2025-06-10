@@ -1,4 +1,4 @@
-_target_: tsfm.data.builder.ConcatDatasetBuilder
+_target_: tsfm.data.builder.ConcatDatasetBuilderWithGlobalIndex
 _args_:
   - _target_: tsfm.data.builder.lotsa_v1.Buildings900KDatasetBuilder
     datasets: ${cls_getattr:${._target_},dataset_list}

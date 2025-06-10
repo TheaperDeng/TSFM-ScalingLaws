@@ -34,10 +34,12 @@ class DataModule(L.LightningDataModule):
         cfg: DictConfig,
         train_dataset: Dataset,
         val_dataset: Optional[Dataset | list[Dataset]],
+        data_builder=None,
     ):
         super().__init__()
         self.cfg = cfg
         self.train_dataset = train_dataset
+        self.data_builder = data_builder
 
         if val_dataset is not None:
             self.val_dataset = val_dataset
@@ -155,9 +157,11 @@ def main(cfg: DictConfig):
     if cfg.compile:
         model.module.compile(mode=cfg.compile)
     trainer: L.Trainer = instantiate(cfg.trainer)
-    train_dataset: Dataset = instantiate(cfg.data).load_dataset(
-        model.train_transform_map
-    )
+    
+    # Instantiate the data builder and create dataset
+    data_builder = instantiate(cfg.data)
+    train_dataset: Dataset = data_builder.load_dataset(model.train_transform_map)
+    
     val_dataset: Optional[Dataset | list[Dataset]] = (
         tree_map(
             lambda ds: ds.load_dataset(model.val_transform_map),
@@ -167,9 +171,13 @@ def main(cfg: DictConfig):
         else None
     )
     L.seed_everything(cfg.seed, workers=True)
+    print("train_dataset:", train_dataset)
+    print("val_dataset:", val_dataset)
+    print("train_dataset size:", len(train_dataset))
+    print("val_dataset size:", len(val_dataset[0]), len(val_dataset[1]), len(val_dataset[2]))
     trainer.fit(
         model,
-        datamodule=DataModule(cfg, train_dataset, val_dataset),
+        datamodule=DataModule(cfg, train_dataset, [val_dataset[1]], data_builder),  # Pass data_builder
         ckpt_path=cfg.ckpt_path,
     )
 

@@ -25,7 +25,7 @@ from torch.utils.data import ConcatDataset, Dataset
 from tsfm.common.core import abstract_class_property
 from tsfm.common.env import env
 from tsfm.data.builder._base import DatasetBuilder
-from tsfm.data.dataset import SampleTimeSeriesType, TimeSeriesDataset
+from tsfm.data.dataset import SampleTimeSeriesType, TimeSeriesDataset, TimeSeriesDatasetWithIndex
 from tsfm.data.indexer import HuggingFaceDatasetIndexer
 from tsfm.transform import Identity, Transformation
 
@@ -38,6 +38,9 @@ class LOTSADatasetBuilder(DatasetBuilder, abc.ABC):
     dataset_type_map: dict[str, type[TimeSeriesDataset]] = NotImplemented
     dataset_load_func_map: dict[str, Callable[..., TimeSeriesDataset]] = NotImplemented
     uniform: bool = False
+    
+    # Use the enhanced dataset with index tracking by default
+    default_dataset_class: type[TimeSeriesDataset] = TimeSeriesDatasetWithIndex
 
     def __init__(
         self,

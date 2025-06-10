@@ -24,7 +24,7 @@ from gluonts.dataset.common import ProcessDataEntry
 from gluonts.dataset.split import DateSplitter
 
 from tsfm.common.env import env
-from tsfm.data.dataset import TimeSeriesDataset
+from tsfm.data.dataset import TimeSeriesDataset, TimeSeriesDatasetWithIndex
 
 from ._base import LOTSADatasetBuilder
 
@@ -35,8 +35,8 @@ class CloudOpsTSFDatasetBuilder(LOTSADatasetBuilder):
         "borg_cluster_data_2011",
         "alibaba_cluster_trace_2018",
     ]
-    dataset_type_map = defaultdict(lambda: TimeSeriesDataset)
-    dataset_load_func_map = defaultdict(lambda: partial(TimeSeriesDataset))
+    dataset_type_map = defaultdict(lambda: TimeSeriesDatasetWithIndex)
+    dataset_load_func_map = defaultdict(lambda: partial(TimeSeriesDatasetWithIndex))
 
     def build_dataset(self, dataset: str, num_proc: int = os.cpu_count()):
         cloudops_dataset = load_dataset(

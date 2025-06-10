@@ -117,6 +117,7 @@ class TransformerEncoderPretrain(L.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["module"])
         self.module = BasicModule(**module_kwargs) if module is None else module
+        self.influence_scores = {}
         
     def forward(
         self,
@@ -193,6 +194,505 @@ class TransformerEncoderPretrain(L.LightningModule):
         )
         return loss
     
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """Calculate per-example gradients for influence function computation"""
+        
+        # Only compute per-example gradients during training
+        if not self.training:
+            return
+        
+        # Get original dataset indices from the new field
+        dataset_indices = batch.get("dataset_index", None)
+        if dataset_indices is None:
+            print(f"Warning: No dataset_index found in batch {batch_idx}")
+            print(f"Make sure to use PadCollateWithDatasetIndex and TimeSeriesDatasetWithIndex")
+            return
+        
+        # Get unique dataset indices (filter out padding with -1)
+        unique_indices = dataset_indices.flatten().unique()
+        unique_indices = unique_indices[unique_indices >= 0]  # Remove padding (-1)
+        
+        # BOUNDS CHECK: Validate indices are within dataset range
+        if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'train_dataset'):
+            dataset_size = len(self.trainer.datamodule.train_dataset)
+            invalid_indices = unique_indices[unique_indices >= dataset_size]
+            if len(invalid_indices) > 0:
+                print(f"WARNING: Found invalid indices {invalid_indices.tolist()} >= dataset size {dataset_size} in batch {batch_idx}")
+                unique_indices = unique_indices[unique_indices < dataset_size]  # Filter out invalid indices
+        
+        print(f"Unique dataset indices in batch {batch_idx}: {unique_indices.tolist()}")
+        
+        # Initialize per-example gradient storage if not exists
+        if not hasattr(self, 'per_example_gradients'):
+            self.per_example_gradients = {}
+            
+        # CLEAN UP: Remove any stale indices from previous runs on first batch
+        if batch_idx == 0 and hasattr(self, 'per_example_gradients'):
+            if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'train_dataset'):
+                dataset_size = len(self.trainer.datamodule.train_dataset)
+                stale_indices = [idx for idx in self.per_example_gradients.keys() if idx >= dataset_size]
+                for idx in stale_indices:
+                    del self.per_example_gradients[idx]
+                if stale_indices:
+                    print(f"CLEANUP: Cleared {len(stale_indices)} stale influence scores from previous runs")
+        
+        # Calculate per-sample gradients using original dataset indices
+        per_sample_grads = self._compute_per_sample_gradients_with_indices(batch, unique_indices)
+        
+        # Store gradients indexed by original dataset index
+        for i, dataset_idx in enumerate(unique_indices):
+            dataset_idx_item = dataset_idx.item()
+            
+            # Extract gradients for this specific sample
+            sample_grads = {}
+            for param_name, grad_batch in per_sample_grads.items():
+                if grad_batch is not None and i < len(grad_batch):
+                    sample_grads[param_name] = grad_batch[i].clone().detach()
+            
+            # Store in per-example gradient dict
+            if dataset_idx_item not in self.per_example_gradients:
+                self.per_example_gradients[dataset_idx_item] = []
+            
+            self.per_example_gradients[dataset_idx_item].append({
+                'gradients': sample_grads,
+                'step': self.global_step,
+                'epoch': self.current_epoch,
+                'loss': outputs
+            })
+
+        # directly calculate the influence scores on validation gradients
+        val_gradients = self.get_validation_gradients_from_trainer()
+        influence_scores = self.compute_influence_scores(val_gradients)
+
+        # update the influence scores, but append the new scores to the end, don't overwrite the existing scores
+        for sample_idx, scores in influence_scores.items():
+            if sample_idx in self.influence_scores:
+                self.influence_scores[sample_idx].extend(scores)
+            else:
+                self.influence_scores[sample_idx] = scores
+
+        # aggregate the influence scores by dataset name
+        dataset_influence_scores = {}
+        count_dataset_scores = {}
+        for sample_idx, scores in self.influence_scores.items():
+            for score in scores:
+                dataset_name = score.get('dataset_name', 'Unknown')
+                if dataset_name not in dataset_influence_scores:
+                    dataset_influence_scores[dataset_name] = 0
+                    count_dataset_scores[dataset_name] = 0
+                # use running average to aggregate the influence scores
+                dataset_influence_scores[dataset_name] = (dataset_influence_scores[dataset_name] * count_dataset_scores[dataset_name] + score['influence_score']) / (count_dataset_scores[dataset_name] + 1)
+                count_dataset_scores[dataset_name] += 1
+        
+        # sort the dataset_influence_scores by the score
+        dataset_influence_scores = sorted(dataset_influence_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # print the dataset_influence_scores in order
+        print("=" * 80)
+        print("DATASET INFLUENCE SCORES:")
+        for dataset_name, score in dataset_influence_scores:
+            print(f"  {dataset_name:25} | Score: {score:10.4f} | Step: {self.global_step:6d} | Epoch: {self.current_epoch:6d} | Count: {count_dataset_scores[dataset_name]:6d}")
+        print("=" * 80)
+
+        # save dataset_influence_scores to a csv file with header
+        with open('dataset_influence_scores.csv', 'a') as f:
+            f.write("dataset_name,score,step,epoch,count\n")
+            for dataset_name, score in dataset_influence_scores:
+                f.write(f"{dataset_name},{score},{self.global_step},{self.current_epoch},{count_dataset_scores[dataset_name]}\n")
+            
+        # clear the per-example gradients
+        self.clear_per_example_gradients()
+        
+
+    def _compute_per_sample_gradients_with_indices(self, batch, unique_indices):
+        """Compute per-sample gradients for samples with specific dataset indices."""
+        per_sample_grads = {}
+        
+        # Initialize gradient storage
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                per_sample_grads[name] = []
+        
+        # Get dataset indices tensor
+        dataset_indices = batch["dataset_index"]
+        
+        # Compute gradient for each unique dataset index
+        for dataset_idx in unique_indices:
+            # Zero gradients
+            self.zero_grad()
+            
+            # Create mask for this dataset index
+            mask = (dataset_indices == dataset_idx)
+            
+            # Find positions where this dataset index appears
+            batch_indices, seq_indices = torch.where(mask)
+            
+            if len(batch_indices) == 0:
+                # No data for this index, store None
+                for name, param in self.named_parameters():
+                    if param.requires_grad:
+                        per_sample_grads[name].append(None)
+                continue
+            
+            # Get unique batch indices (samples in the batch containing this dataset index)
+            unique_batch_indices = batch_indices.unique()
+            
+            # Create a mini-batch with only the relevant samples
+            single_batch = {}
+            for key, value in batch.items():
+                if torch.is_tensor(value):
+                    if value.dim() > 1:
+                        # Take only the samples that contain this dataset index
+                        single_batch[key] = value[unique_batch_indices]
+                    else:
+                        single_batch[key] = value
+                else:
+                    single_batch[key] = value
+            
+            # Forward pass for this dataset index
+            try:
+                output = self(**{
+                    field: single_batch[field] 
+                    for field in list(self.train_seq_fields) + ["sample_id"]
+                    if field in single_batch
+                })
+                
+                # Compute loss for this dataset index
+                loss = self.hparams.loss_func(
+                    pred=output,
+                    target=single_batch.get("label"),
+                    observed_mask=single_batch.get("label_observed_mask"),
+                    prediction_mask=single_batch.get("prediction_mask"),
+                    sample_id=single_batch.get("sample_id"),
+                    variate_id=single_batch.get("variate_id"),
+                )
+                
+                # Scale loss by the proportion of data from this dataset index
+                total_elements = mask.sum().item()
+                loss = loss * total_elements / mask.numel()
+                
+                # Backward pass
+                loss.backward(retain_graph=True)
+                
+                # Store gradients
+                for name, param in self.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        per_sample_grads[name].append(param.grad.clone().detach())
+                    else:
+                        per_sample_grads[name].append(None)
+                    
+            except Exception as e:
+                print(f"Error computing gradient for dataset index {dataset_idx}: {e}")
+                # Store None for this sample
+                for name, param in self.named_parameters():
+                    if param.requires_grad:
+                        per_sample_grads[name].append(None)
+        
+        # Convert lists to tensors
+        for name in per_sample_grads:
+            valid_grads = [g for g in per_sample_grads[name] if g is not None]
+            if valid_grads:
+                per_sample_grads[name] = torch.stack(valid_grads, dim=0)
+            else:
+                per_sample_grads[name] = None
+        
+        # Clear gradients
+        self.zero_grad()
+        
+        return per_sample_grads
+
+    def compute_influence_scores(self, val_gradients):
+        """Compute influence scores by inner product with validation gradients"""
+        if not hasattr(self, 'per_example_gradients'):
+            print("No per-example gradients stored")
+            return {}
+        
+        influence_scores = {}
+        
+        # Try to get dataset metadata for mapping global indices to dataset names
+        dataset_metadata = None
+        try:
+            if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'train_dataset'):
+                train_dataset = self.trainer.datamodule.train_dataset
+                # Navigate to the ConcatDatasetBuilderWithGlobalIndex if it exists
+                # This assumes the train_dataset was created by instantiating a config with a ConcatDatasetBuilderWithGlobalIndex
+                # We need to trace back to find the dataset builder that created this dataset
+                if hasattr(train_dataset, 'datasets'):  # ConcatDataset
+                    # Look for global index metadata in any of the sub-datasets
+                    for sub_dataset in train_dataset.datasets:
+                        if hasattr(sub_dataset, 'global_offset'):
+                            # This indicates we're using the enhanced datasets with global indexing
+                            # We need to find the builder that created the dataset hierarchy
+                            pass
+        except Exception as e:
+            print(f"Warning: Could not access dataset metadata for sub-dataset names: {e}")
+        
+        for sample_idx, grad_history in self.per_example_gradients.items():
+            sample_scores = []
+            
+            for grad_entry in grad_history:
+                train_grads = grad_entry['gradients']
+                
+                # Compute inner product with validation gradients
+                inner_product = 0.0
+                param_count = 0
+                
+                for param_name in train_grads:
+                    if param_name in val_gradients and train_grads[param_name] is not None:
+                        train_grad = train_grads[param_name].flatten()
+                        val_grad = val_gradients[param_name].flatten()
+                        
+                        # Ensure same size
+                        if train_grad.shape == val_grad.shape:
+                            inner_product += torch.dot(train_grad, val_grad).item()
+                            param_count += 1
+                
+                if param_count > 0:
+                    score_entry = {
+                        'influence_score': inner_product,
+                        'step': grad_entry['step'],
+                        'epoch': grad_entry['epoch'],
+                        'loss': grad_entry['loss']['loss'].item(),
+                        'global_dataset_index': sample_idx  # Store the global index
+                    }
+                    
+                    # Try to add dataset name if we can map global index to dataset
+                    if dataset_metadata and sample_idx in dataset_metadata:
+                        score_entry['dataset_name'] = dataset_metadata[sample_idx]
+                    else:
+                        # Fallback: try to map using a simpler approach
+                        score_entry['dataset_name'] = self._get_dataset_name_for_index(sample_idx)
+                    
+                    sample_scores.append(score_entry)
+            
+            influence_scores[sample_idx] = sample_scores
+        
+        return influence_scores
+    
+    def _get_dataset_name_for_index(self, global_idx: int) -> str:
+        """Helper method to get dataset name for a global index."""
+        try:
+            # BOUNDS CHECK: Validate global_idx is within reasonable range
+            max_dataset_size = 20000  # Reasonable upper bound
+            if global_idx > max_dataset_size:
+                print(f"WARNING: Global index {global_idx} exceeds reasonable bounds (>{max_dataset_size}). This might indicate stale influence scores.")
+                return f"OutOfBounds_Idx_{global_idx}"
+            
+            # Method 1: Try to use ConcatDatasetBuilderWithGlobalIndex metadata (preferred)
+            if (hasattr(self.trainer, 'datamodule') and 
+                hasattr(self.trainer.datamodule, 'data_builder') and
+                hasattr(self.trainer.datamodule.data_builder, 'get_dataset_name_for_global_index')):
+                
+                # Additional bounds check using actual dataset size
+                if hasattr(self.trainer.datamodule, 'train_dataset'):
+                    dataset_size = len(self.trainer.datamodule.train_dataset)
+                    if global_idx >= dataset_size:
+                        print(f"WARNING: Global index {global_idx} >= dataset size {dataset_size}. Clearing stale influence scores.")
+                        # Clear stale per_example_gradients to prevent future issues
+                        if hasattr(self, 'per_example_gradients'):
+                            # Remove any indices beyond the current dataset size
+                            stale_indices = [idx for idx in self.per_example_gradients.keys() if idx >= dataset_size]
+                            for idx in stale_indices:
+                                del self.per_example_gradients[idx]
+                            if stale_indices:
+                                print(f"Cleared {len(stale_indices)} stale influence scores with indices: {stale_indices[:10]}{'...' if len(stale_indices) > 10 else ''}")
+                        return f"Stale_Idx_{global_idx}_Cleared"
+                
+                return self.trainer.datamodule.data_builder.get_dataset_name_for_global_index(global_idx)
+            
+            # Method 2: Fallback to manual traversal of ConcatDataset
+            elif hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'train_dataset'):
+                train_dataset = self.trainer.datamodule.train_dataset
+                
+                # Bounds check against actual dataset
+                if global_idx >= len(train_dataset):
+                    print(f"WARNING: Global index {global_idx} >= actual dataset size {len(train_dataset)}")
+                    return f"OutOfRange_Idx_{global_idx}"
+                
+                # Check if it's a ConcatDataset with sub-datasets that have global_offset
+                if hasattr(train_dataset, 'datasets'):
+                    cumulative_size = 0
+                    for i, sub_dataset in enumerate(train_dataset.datasets):
+                        dataset_size = len(sub_dataset)
+                        if global_idx < cumulative_size + dataset_size:
+                            # This global index belongs to this sub-dataset
+                            # Try to get the dataset name from various sources
+                            
+                            # Method 2a: Check if dataset has indexer with dataset info
+                            if hasattr(sub_dataset, 'indexer') and hasattr(sub_dataset.indexer, 'dataset'):
+                                if hasattr(sub_dataset.indexer.dataset, 'info') and hasattr(sub_dataset.indexer.dataset.info, 'dataset_name'):
+                                    return sub_dataset.indexer.dataset.info.dataset_name
+                            
+                            # Method 2b: Check if dataset itself has info
+                            if hasattr(sub_dataset, 'info') and hasattr(sub_dataset.info, 'dataset_name'):
+                                return sub_dataset.info.dataset_name
+                            
+                            # Method 2c: Return a descriptive name based on position
+                            return f"SubDataset_{i}"
+                        
+                        cumulative_size += dataset_size
+            
+            # Final fallback
+            return f"Dataset_GlobalIdx_{global_idx}"
+            
+        except Exception as e:
+            return f"Unknown_Idx_{global_idx}_Error_{str(e)[:30]}"
+
+    def get_validation_gradients_from_trainer(self):
+        """Compute gradients using trainer's validation dataloader"""
+        
+        if not hasattr(self.trainer, 'val_dataloaders') or not self.trainer.val_dataloaders:
+            print("Warning: No validation dataloader found in trainer")
+            return {}
+        
+        # Get validation dataloader from trainer
+        val_dataloader = self.trainer.val_dataloaders[0]  # Use first validation dataloader
+        
+        return self.get_validation_gradients(val_dataloader)
+
+    def get_validation_gradients(self, dataloader_or_dataset):
+        """Compute gradients on entire validation dataset for influence computation"""
+        
+        # Save current training state
+        was_training = self.training
+        self.eval()
+        self.zero_grad()
+        
+        # Handle both dataset and dataloader inputs
+        if hasattr(dataloader_or_dataset, '__iter__') and hasattr(dataloader_or_dataset, '__len__'):
+            # It's a dataloader
+            val_dataloader = dataloader_or_dataset
+        else:
+            # It's a dataset, create dataloader
+            from torch.utils.data import DataLoader
+            val_dataloader = DataLoader(
+                dataloader_or_dataset,
+                batch_size=32,  # Smaller batch size for memory efficiency
+                shuffle=False,
+                collate_fn=getattr(dataloader_or_dataset, 'collate_fn', None)
+            )
+        
+        total_samples = 0
+        accumulated_gradients = {}
+        
+        print(f"Computing validation gradients over {len(val_dataloader)} batches...")
+        print(f"NOTE: Validation dataset indices will NOT interfere with training influence scores")
+        
+        # SOLUTION: Manual gradient accumulation with immediate cleanup
+        for batch_idx, val_batch in enumerate(val_dataloader):
+            try:
+                # Clear gradients for this batch
+                self.zero_grad()
+                
+                # IMPORTANT: Remove dataset_index from validation batch to prevent contamination
+                # Validation dataset indices should NOT be used for influence computation
+                val_batch_clean = {k: v for k, v in val_batch.items() if k != 'dataset_index'}
+                if 'dataset_index' in val_batch:
+                    # Log warning about validation dataset index contamination
+                    val_indices = val_batch['dataset_index'].flatten().unique()
+                    val_indices_valid = val_indices[val_indices >= 0]
+                    if len(val_indices_valid) > 0 and batch_idx == 0:  # Only log once
+                        max_val_idx = val_indices_valid.max().item()
+                        print(f"INFO: Validation batch contains dataset indices up to {max_val_idx}")
+                        print(f"INFO: These indices are EXCLUDED from influence computation to prevent contamination")
+                
+                # Move tensors to device (consider CPU for very large models)
+                val_batch_clean = {
+                    k: v.to(self.device) if torch.is_tensor(v) else v 
+                    for k, v in val_batch_clean.items()
+                }
+                
+                # Forward pass with gradient computation
+                with torch.enable_grad():
+                    output = self(**{
+                        field: val_batch_clean[field] 
+                        for field in list(self.train_seq_fields) + ["sample_id"]
+                        if field in val_batch_clean
+                    })
+                    
+                    # Compute loss for this batch
+                    batch_loss = self.hparams.loss_func(
+                        pred=output,
+                        target=val_batch_clean["label"],
+                        observed_mask=val_batch_clean["label_observed_mask"],
+                        prediction_mask=val_batch_clean["prediction_mask"],
+                        sample_id=val_batch_clean["sample_id"],
+                        variate_id=val_batch_clean["variate_id"],
+                    )
+                    
+                    # Get actual batch size for proper weighting
+                    batch_size = (
+                        val_batch_clean["sample_id"].max(dim=1).values.sum().item() 
+                        if "sample_id" in val_batch_clean and val_batch_clean["sample_id"].dim() > 1
+                        else val_batch_clean["target"].shape[0]
+                    )
+                    
+                    # Backward pass - this computes gradients for this batch only
+                    batch_loss.backward()
+                
+                # Manually accumulate gradients
+                for name, param in self.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        grad = param.grad.clone().detach() * batch_size  # Weight by batch size
+                        
+                        if name not in accumulated_gradients:
+                            accumulated_gradients[name] = grad
+                        else:
+                            accumulated_gradients[name] += grad
+                
+                total_samples += batch_size
+                
+                # Clear intermediate variables to free memory
+                del output, batch_loss, val_batch
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                
+                if (batch_idx + 1) % 10 == 0:
+                    print(f"Processed {batch_idx + 1}/{len(val_dataloader)} validation batches")
+                    
+            except Exception as e:
+                print(f"Error in validation batch {batch_idx}: {e}")
+                continue
+        
+        if total_samples == 0:
+            print("Warning: No validation samples processed")
+            return {}
+        
+        # Average the accumulated gradients
+        val_gradients = {}
+        for name, accumulated_grad in accumulated_gradients.items():
+            val_gradients[name] = accumulated_grad / total_samples
+        
+        # Clear gradients and restore training state
+        self.zero_grad()
+        if was_training:
+            self.train()
+        
+        print(f"Computed validation gradients for {len(val_gradients)} parameters over {total_samples} samples")
+        
+        return val_gradients
+
+    # Optional: Add memory management
+    def clear_per_example_gradients(self, keep_recent_steps=10):
+        """Clear old per-example gradients to manage memory"""
+        if not hasattr(self, 'per_example_gradients'):
+            return
+        
+        current_step = self.global_step
+        
+        for sample_idx in list(self.per_example_gradients.keys()):
+            # Keep only recent gradients
+            recent_grads = [
+                grad_entry for grad_entry in self.per_example_gradients[sample_idx]
+                if current_step - grad_entry['step'] <= keep_recent_steps
+            ]
+            
+            if recent_grads:
+                self.per_example_gradients[sample_idx] = recent_grads
+            else:
+                del self.per_example_gradients[sample_idx]
+        
+        print(f"Cleared old gradients, keeping {keep_recent_steps} recent steps")
+
     def validation_step(
         self, batch: dict[str, torch.Tensor], batch_idx: int, dataloader_idx: int = 0
     ) -> torch.Tensor:
@@ -444,7 +944,7 @@ class TransformerEncoderPretrain(L.LightningModule):
                     feat=True,
                 )
                 + SequencifyField(field="patch_size", target_field="target")
-                + SelectFields(fields=list(self.seq_fields))
+                + SelectFields(fields=list(self.seq_fields) + ["_dataset_idx"])
             )
 
         return defaultdict(lambda: default_train_transform)
@@ -571,7 +1071,7 @@ class TransformerEncoderPretrain(L.LightningModule):
                     feat=True,
                 )
                 + SequencifyField(field="patch_size", target_field="target")
-                + SelectFields(fields=list(self.seq_fields))
+                + SelectFields(fields=list(self.seq_fields) + ["_dataset_idx"])
             )
 
         return defaultdict(lambda: default_val_transform)

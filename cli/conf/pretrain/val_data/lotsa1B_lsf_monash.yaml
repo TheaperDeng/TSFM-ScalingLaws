@@ -1,4 +1,4 @@
-- _target_: tsfm.data.builder.ConcatDatasetBuilder
+- _target_: tsfm.data.builder.ConcatDatasetBuilderWithGlobalIndex
   _args_:
     - _target_: tsfm.data.builder.simple.SimpleEvalDatasetBuilder
       dataset: m1_monthly
@@ -348,7 +348,7 @@
       sample_time_series:
         _target_: tsfm.data.dataset.SampleTimeSeriesType
         _args_: ["proportional"]
-- _target_: tsfm.data.builder.ConcatDatasetBuilder
+- _target_: tsfm.data.builder.ConcatDatasetBuilderWithGlobalIndex
   _args_:
     - _target_: tsfm.data.builder.simple.SimpleEvalDatasetBuilder
       dataset: ETTh1
@@ -422,7 +422,7 @@
       sample_time_series:
         _target_: tsfm.data.dataset.SampleTimeSeriesType
         _args_: ["proportional"]
-- _target_: tsfm.data.builder.ConcatDatasetBuilder
+- _target_: tsfm.data.builder.ConcatDatasetBuilderWithGlobalIndex
   _args_:
     - _target_: tsfm.data.builder.simple.SimpleEvalDatasetBuilder
       dataset: wiki-rolling_nips

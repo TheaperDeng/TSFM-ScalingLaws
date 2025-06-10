@@ -26,7 +26,7 @@ from datasets import Features, Sequence, Value
 from pandas.tseries.frequencies import to_offset
 
 from tsfm.common.env import env
-from tsfm.data.dataset import MultiSampleTimeSeriesDataset
+from tsfm.data.dataset import MultiSampleTimeSeriesDataset, MultiSampleTimeSeriesDatasetWithIndex
 
 from ._base import LOTSADatasetBuilder
 
@@ -47,10 +47,10 @@ class LibCityDatasetBuilder(LOTSADatasetBuilder):
         "SHMETRO",
         "SZ_TAXI",
     ]
-    dataset_type_map = defaultdict(lambda: MultiSampleTimeSeriesDataset)
+    dataset_type_map = defaultdict(lambda: MultiSampleTimeSeriesDatasetWithIndex)
     dataset_load_func_map = defaultdict(
         lambda: partial(
-            MultiSampleTimeSeriesDataset,
+            MultiSampleTimeSeriesDatasetWithIndex,
             max_ts=128,
             combine_fields=("target", "past_feat_dynamic_real"),
         )

@@ -25,7 +25,7 @@ from datasets import Features, Sequence, Value
 
 from tsfm.common.env import env
 from tsfm.common.typing import GenFunc
-from tsfm.data.dataset import MultiSampleTimeSeriesDataset, TimeSeriesDataset
+from tsfm.data.dataset import MultiSampleTimeSeriesDataset, MultiSampleTimeSeriesDatasetWithIndex, TimeSeriesDataset, TimeSeriesDatasetWithIndex
 
 from ._base import LOTSADatasetBuilder
 
@@ -332,12 +332,12 @@ class ProEnFoDatasetBuilder(LOTSADatasetBuilder):
         "hog",
         "covid19_energy",
     ]
-    dataset_type_map = defaultdict(lambda: TimeSeriesDataset) | {
-        dataset: MultiSampleTimeSeriesDataset for dataset in MULTI_SAMPLE_DATASETS
+    dataset_type_map = defaultdict(lambda: TimeSeriesDatasetWithIndex) | {
+        dataset: MultiSampleTimeSeriesDatasetWithIndex for dataset in MULTI_SAMPLE_DATASETS
     }
-    dataset_load_func_map = defaultdict(lambda: partial(TimeSeriesDataset)) | {
+    dataset_load_func_map = defaultdict(lambda: partial(TimeSeriesDatasetWithIndex)) | {
         dataset: partial(
-            MultiSampleTimeSeriesDataset,
+            MultiSampleTimeSeriesDatasetWithIndex,
             max_ts=128,
             combine_fields=("target", "past_feat_dynamic_real"),
         )

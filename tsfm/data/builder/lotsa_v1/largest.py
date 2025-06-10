@@ -24,7 +24,7 @@ import pandas as pd
 from datasets import Features, Sequence, Value
 
 from tsfm.common.env import env
-from tsfm.data.dataset import TimeSeriesDataset
+from tsfm.data.dataset import TimeSeriesDataset, TimeSeriesDatasetWithIndex
 
 from ._base import LOTSADatasetBuilder
 
@@ -37,8 +37,8 @@ class LargeSTDatasetBuilder(LOTSADatasetBuilder):
         "largest_2020",
         "largest_2021",
     ]
-    dataset_type_map = defaultdict(lambda: TimeSeriesDataset)
-    dataset_load_func_map = defaultdict(lambda: partial(TimeSeriesDataset))
+    dataset_type_map = defaultdict(lambda: TimeSeriesDatasetWithIndex)
+    dataset_load_func_map = defaultdict(lambda: partial(TimeSeriesDatasetWithIndex))
 
     def build_dataset(self, dataset: str, num_proc: int = os.cpu_count()):
         year = dataset.split("_")[-1]

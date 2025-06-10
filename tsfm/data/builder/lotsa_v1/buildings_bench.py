@@ -36,7 +36,7 @@ except ImportError:
 
 
 from tsfm.common.env import env
-from tsfm.data.dataset import MultiSampleTimeSeriesDataset, TimeSeriesDataset
+from tsfm.data.dataset import MultiSampleTimeSeriesDataset, MultiSampleTimeSeriesDatasetWithIndex, TimeSeriesDataset, TimeSeriesDatasetWithIndex
 
 from ._base import LOTSADatasetBuilder
 
@@ -57,12 +57,12 @@ class BuildingsBenchDatasetBuilder(LOTSADatasetBuilder):
         "smart",
         "lcl",
     ]
-    dataset_type_map = defaultdict(lambda: TimeSeriesDataset) | {
-        dataset: MultiSampleTimeSeriesDataset for dataset in MULTI_SAMPLE_DATASETS
+    dataset_type_map = defaultdict(lambda: TimeSeriesDatasetWithIndex) | {
+        dataset: MultiSampleTimeSeriesDatasetWithIndex for dataset in MULTI_SAMPLE_DATASETS
     }
-    dataset_load_func_map = defaultdict(lambda: partial(TimeSeriesDataset)) | {
+    dataset_load_func_map = defaultdict(lambda: partial(TimeSeriesDatasetWithIndex)) | {
         dataset: partial(
-            MultiSampleTimeSeriesDataset,
+            MultiSampleTimeSeriesDatasetWithIndex,
             max_ts=128,
             combine_fields=("target", "past_feat_dynamic_real"),
         )
@@ -110,9 +110,9 @@ class BuildingsBenchDatasetBuilder(LOTSADatasetBuilder):
 
 class Buildings900KDatasetBuilder(LOTSADatasetBuilder):
     dataset_list: list[str] = ["buildings_900k"]
-    dataset_type_map = dict(buildings_900k=TimeSeriesDataset)
+    dataset_type_map = dict(buildings_900k=TimeSeriesDatasetWithIndex)
     dataset_load_func_map = dict(
-        buildings_900k=partial(TimeSeriesDataset),
+        buildings_900k=partial(TimeSeriesDatasetWithIndex),
     )
 
     def build_dataset(self, dataset: str, num_proc: int = os.cpu_count()):

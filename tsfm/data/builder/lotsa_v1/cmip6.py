@@ -26,7 +26,7 @@ import pandas as pd
 from datasets import Features, Sequence, Value
 
 from tsfm.common.env import env
-from tsfm.data.dataset import TimeSeriesDataset
+from tsfm.data.dataset import TimeSeriesDataset, TimeSeriesDatasetWithIndex
 
 from ._base import LOTSADatasetBuilder
 
@@ -71,8 +71,8 @@ CMIP6_VARIABLES = [
 
 class CMIP6DatasetBuilder(LOTSADatasetBuilder):
     dataset_list = [f"cmip6_{year}" for year in range(1850, 2015, 5)]
-    dataset_type_map = defaultdict(lambda: TimeSeriesDataset)
-    dataset_load_func_map = defaultdict(lambda: partial(TimeSeriesDataset))
+    dataset_type_map = defaultdict(lambda: TimeSeriesDatasetWithIndex)
+    dataset_load_func_map = defaultdict(lambda: partial(TimeSeriesDatasetWithIndex))
     uniform = True
 
     def build_dataset(self, dataset: str, num_proc: int = os.cpu_count()):

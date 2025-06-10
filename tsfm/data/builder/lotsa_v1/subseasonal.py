@@ -31,7 +31,7 @@ except ImportError as e:
 
 from tsfm.common.env import env
 from tsfm.common.typing import GenFunc
-from tsfm.data.dataset import MultiSampleTimeSeriesDataset
+from tsfm.data.dataset import MultiSampleTimeSeriesDataset, MultiSampleTimeSeriesDatasetWithIndex
 
 from ._base import LOTSADatasetBuilder
 
@@ -129,10 +129,10 @@ class SubseasonalDatasetBuilder(LOTSADatasetBuilder):
         "subseasonal",
         "subseasonal_precip",
     ]
-    dataset_type_map = defaultdict(lambda: MultiSampleTimeSeriesDataset)
+    dataset_type_map = defaultdict(lambda: MultiSampleTimeSeriesDatasetWithIndex)
     dataset_load_func_map = defaultdict(
         lambda: partial(
-            MultiSampleTimeSeriesDataset, max_ts=128, combine_fields=("target",)
+            MultiSampleTimeSeriesDatasetWithIndex, max_ts=128, combine_fields=("target",)
         )
     )
 

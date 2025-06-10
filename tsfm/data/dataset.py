@@ -79,6 +79,47 @@ class TimeSeriesDataset(Dataset):
         }
 
 
+class TimeSeriesDatasetWithIndex(TimeSeriesDataset):
+    """Enhanced TimeSeriesDataset that preserves original dataset indices for influence function computation."""
+    
+    def __init__(
+        self,
+        indexer,
+        transform,
+        sample_time_series=SampleTimeSeriesType.NONE,
+        dataset_weight=1.0,
+        global_offset=0,
+    ):
+        super().__init__(indexer, transform, sample_time_series, dataset_weight)
+        self.global_offset = global_offset
+    
+    def set_global_offset(self, offset: int):
+        """Set the global offset for this dataset within a concatenated dataset."""
+        self.global_offset = offset
+    
+    def __getitem__(self, idx: int) -> dict[str, FlattenedData]:
+        if idx < 0 or idx >= len(self):
+            raise IndexError(
+                f"Index {idx} out of range for dataset of length {len(self)}"
+            )
+
+        original_idx = idx  # Store the original index before any transformations
+        
+        if self.sample_time_series != SampleTimeSeriesType.NONE:
+            # If sampling is used, we still want to track the original sampled index
+            sampled_idx = np.random.choice(len(self.probabilities), p=self.probabilities)
+            original_idx = sampled_idx  # Track the actual sampled index
+            idx = sampled_idx
+
+        # Get the data and add the GLOBAL dataset index metadata
+        data = self._get_data(idx)
+        local_idx = original_idx % self.num_ts
+        global_idx = self.global_offset + local_idx  # This is the true GLOBAL dataset index
+        data['_dataset_idx'] = global_idx
+        # print(f"Local idx: {local_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
+        return self.transform(self._flatten_data(data))
+
+
 class MultiSampleTimeSeriesDataset(TimeSeriesDataset):
     def __init__(
         self,
@@ -123,6 +164,68 @@ class MultiSampleTimeSeriesDataset(TimeSeriesDataset):
         return samples
 
 
+class MultiSampleTimeSeriesDatasetWithIndex(MultiSampleTimeSeriesDataset):
+    """Enhanced MultiSampleTimeSeriesDataset that preserves original dataset indices for influence function computation."""
+    
+    def __init__(
+        self,
+        indexer: Indexer[dict[str, Any]],
+        transform: Transformation,
+        max_ts: int,
+        combine_fields: tuple[str, ...],
+        sample_time_series: SampleTimeSeriesType = SampleTimeSeriesType.NONE,
+        dataset_weight: float = 1.0,
+        sampler: Sampler = get_sampler("beta_binomial", a=2, b=5),
+        global_offset: int = 0,
+    ):
+        super().__init__(indexer, transform, max_ts, combine_fields, sample_time_series, dataset_weight, sampler)
+        self.global_offset = global_offset
+    
+    def set_global_offset(self, offset: int):
+        """Set the global offset for this dataset within a concatenated dataset."""
+        self.global_offset = offset
+    
+    def __getitem__(self, idx: int) -> dict[str, FlattenedData]:
+        if idx < 0 or idx >= len(self):
+            raise IndexError(
+                f"Index {idx} out of range for dataset of length {len(self)}"
+            )
+
+        original_idx = idx  # Store the original index before any transformations
+        
+        if self.sample_time_series != SampleTimeSeriesType.NONE:
+            # If sampling is used, we still want to track the original sampled index
+            sampled_idx = np.random.choice(len(self.probabilities), p=self.probabilities)
+            original_idx = sampled_idx  # Track the actual sampled index
+            idx = sampled_idx
+
+        # Get the data and add the GLOBAL dataset index metadata
+        data = self._get_data(idx)
+        local_idx = original_idx % self.num_ts
+        global_idx = self.global_offset + local_idx  # This is the true GLOBAL dataset index
+        data['_dataset_idx'] = global_idx
+        # print(f"MultiSample - Local idx: {local_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
+        return self.transform(self._flatten_data(data))
+
+    def _flatten_data(
+        self, samples: dict[str, BatchedData]
+    ) -> dict[str, FlattenedData]:
+        """Override to handle the _dataset_idx field for influence function tracking."""
+        # Handle the special _dataset_idx field
+        dataset_idx = None
+        if '_dataset_idx' in samples:
+            dataset_idx = samples.pop('_dataset_idx')
+        
+        # Process the normal fields using the parent method
+        flattened = super()._flatten_data(samples)
+        
+        # Add back the dataset index field
+        if dataset_idx is not None:
+            flattened['_dataset_idx'] = dataset_idx
+            
+        return flattened
+
+
 class EvalDataset(TimeSeriesDataset):
     def __init__(
         self,
@@ -143,3 +246,45 @@ class EvalDataset(TimeSeriesDataset):
         item = self.indexer[idx]
         item["window"] = window
         return item
+
+
+class EvalDatasetWithIndex(EvalDataset):
+    """Enhanced EvalDataset that preserves original dataset indices for influence function computation."""
+    
+    def __init__(
+        self,
+        windows: int,
+        indexer: Indexer[dict[str, Any]],
+        transform: Transformation,
+        sample_time_series: SampleTimeSeriesType = SampleTimeSeriesType.NONE,
+        global_offset: int = 0,
+    ):
+        super().__init__(windows, indexer, transform, sample_time_series)
+        self.global_offset = global_offset
+    
+    def set_global_offset(self, offset: int):
+        """Set the global offset for this dataset within a concatenated dataset."""
+        self.global_offset = offset
+    
+    def __getitem__(self, idx: int) -> dict[str, FlattenedData]:
+        if idx < 0 or idx >= len(self):
+            raise IndexError(
+                f"Index {idx} out of range for dataset of length {len(self)}"
+            )
+
+        original_idx = idx  # Store the original index before any transformations
+        
+        if self.sample_time_series != SampleTimeSeriesType.NONE:
+            # If sampling is used, we still want to track the original sampled index  
+            sampled_idx = np.random.choice(len(self.probabilities), p=self.probabilities)
+            original_idx = sampled_idx  # Track the actual sampled index
+            idx = sampled_idx
+
+        # Get the data and add the GLOBAL dataset index metadata
+        data = self._get_data(idx)
+        # For EvalDataset, we need to account for the window dimension
+        window, local_idx = divmod(original_idx, self.num_ts)
+        global_idx = self.global_offset + local_idx  # This is the true GLOBAL dataset index
+        data['_dataset_idx'] = global_idx
+        # print(f"Eval - Window: {window}, Local idx: {local_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
+        return self.transform(self._flatten_data(data))

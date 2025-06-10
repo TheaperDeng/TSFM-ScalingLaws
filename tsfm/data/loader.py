@@ -79,6 +79,58 @@ class PadCollate(Collate):
         return sample_id
 
 
+class PadCollateWithDatasetIndex(PadCollate):
+    """Enhanced PadCollate that preserves original dataset indices for influence function computation."""
+    
+    def __call__(self, batch: list[Sample]) -> BatchedSample:
+        assert all(
+            [
+                len(sample[self.target_field]) == len(sample[key])
+                for sample in batch
+                for key in self.seq_fields
+            ]
+        ), "All fields must have the same length."
+        assert all(
+            [len(sample[self.target_field]) <= self.max_length for sample in batch]
+        ), f"Sample length must be less than or equal to max_length ({self.max_length})"
+
+        sample_id = self.get_sample_id(batch)
+        dataset_index = self.get_dataset_index(batch)
+        padded_batch = self.pad_samples(batch)
+        merged_batch = padded_batch | dict(sample_id=sample_id, dataset_index=dataset_index)
+        return merged_batch
+
+    def get_dataset_index(self, batch: list[Sample]) -> Int[torch.Tensor, "batch seq"]:
+        """Get original dataset indices for each sample."""
+        dataset_indices = []
+        
+        for i, sample in enumerate(batch):
+            length = len(sample[self.target_field])
+            # Get the original dataset index from sample metadata
+            # This field should always be present now that all dataset types support it
+            original_idx = sample['_dataset_idx']
+            
+            # Create tensor: original index for real data, -1 for padding
+            sample_indices = torch.cat([
+                torch.full((length,), original_idx, dtype=torch.long),
+                torch.full((self.max_length - length,), -1, dtype=torch.long)  # -1 for padding
+            ])
+            dataset_indices.append(sample_indices)
+        
+        return torch.stack(dataset_indices)
+        
+    def get_sample_id(self, batch: list[Sample]) -> Int[torch.Tensor, "batch seq"]:
+        """Keep the original sample_id logic for backward compatibility."""
+        sample_id = torch.stack(
+            [
+                torch.cat([torch.ones(length), torch.zeros(self.max_length - length)])
+                for sample in batch
+                if (length := len(sample[self.target_field]))
+            ]
+        ).to(torch.long)
+        return sample_id
+
+
 class PackCollate(Collate):
     def __call__(self, batch: list[Sample]) -> BatchedSample:
         assert all(

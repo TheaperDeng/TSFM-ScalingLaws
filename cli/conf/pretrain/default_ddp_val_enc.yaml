@@ -48,18 +48,18 @@ trainer:
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
   limit_val_batches: 0.1
-  check_val_every_n_epoch: 10
+  check_val_every_n_epoch: 1
   num_sanity_val_steps: -1
 train_dataloader:
   _target_: tsfm.data.loader.DataLoader
-  batch_size: 128
+  batch_size: 32
   batch_size_factor: 2.0
   cycle: true
-  num_batches_per_epoch: 100
+  num_batches_per_epoch: 400
   shuffle: true
   num_workers: 11
   collate_fn:
-    _target_: tsfm.data.loader.PackCollate
+    _target_: tsfm.data.loader.PadCollateWithDatasetIndex
     max_length: ${model.module_kwargs.max_seq_len}
     seq_fields: ${cls_getattr:${model._target_},seq_fields}
     pad_func_map: ${cls_getattr:${model._target_},pad_func_map}
@@ -75,7 +75,7 @@ val_dataloader:
   shuffle: true
   num_workers: 11
   collate_fn:
-    _target_: tsfm.data.loader.PadCollate
+    _target_: tsfm.data.loader.PadCollateWithDatasetIndex
     max_length: 48
     seq_fields: ${cls_getattr:${model._target_},seq_fields}
     pad_func_map: ${cls_getattr:${model._target_},pad_func_map}

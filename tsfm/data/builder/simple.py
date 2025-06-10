@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 
 from tsfm.common.env import env
 from tsfm.common.typing import GenFunc
-from tsfm.data.dataset import EvalDataset, SampleTimeSeriesType, TimeSeriesDataset
+from tsfm.data.dataset import EvalDataset, EvalDatasetWithIndex, SampleTimeSeriesType, TimeSeriesDataset, TimeSeriesDatasetWithIndex
 from tsfm.data.indexer import HuggingFaceDatasetIndexer
 from tsfm.transform import Transformation
 
@@ -162,7 +162,7 @@ class SimpleDatasetBuilder(DatasetBuilder):
     def load_dataset(
         self, transform_map: dict[str, Callable[..., Transformation]]
     ) -> Dataset:
-        return TimeSeriesDataset(
+        return TimeSeriesDatasetWithIndex(
             HuggingFaceDatasetIndexer(
                 datasets.load_from_disk(
                     str(self.storage_path / self.dataset),
@@ -214,7 +214,7 @@ class SimpleEvalDatasetBuilder(DatasetBuilder):
     def load_dataset(
         self, transform_map: dict[str, Callable[..., Transformation]]
     ) -> Dataset:
-        return EvalDataset(
+        return EvalDatasetWithIndex(
             self.windows,
             HuggingFaceDatasetIndexer(
                 datasets.load_from_disk(
