@@ -113,10 +113,11 @@ class TimeSeriesDatasetWithIndex(TimeSeriesDataset):
 
         # Get the data and add the GLOBAL dataset index metadata
         data = self._get_data(idx)
-        local_idx = original_idx % self.num_ts
-        global_idx = self.global_offset + local_idx  # This is the true GLOBAL dataset index
+        # For weighted datasets, each virtual sample gets a unique global index
+        # even if they map to the same physical time series
+        global_idx = self.global_offset + original_idx
         data['_dataset_idx'] = global_idx
-        # print(f"Local idx: {local_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
+        # print(f"Original idx: {original_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
         return self.transform(self._flatten_data(data))
 
 
@@ -201,10 +202,11 @@ class MultiSampleTimeSeriesDatasetWithIndex(MultiSampleTimeSeriesDataset):
 
         # Get the data and add the GLOBAL dataset index metadata
         data = self._get_data(idx)
-        local_idx = original_idx % self.num_ts
-        global_idx = self.global_offset + local_idx  # This is the true GLOBAL dataset index
+        # For weighted datasets, each virtual sample gets a unique global index
+        # even if they map to the same physical time series
+        global_idx = self.global_offset + original_idx
         data['_dataset_idx'] = global_idx
-        # print(f"MultiSample - Local idx: {local_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
+        # print(f"MultiSample - Original idx: {original_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
         return self.transform(self._flatten_data(data))
 
     def _flatten_data(
@@ -282,9 +284,9 @@ class EvalDatasetWithIndex(EvalDataset):
 
         # Get the data and add the GLOBAL dataset index metadata
         data = self._get_data(idx)
-        # For EvalDataset, we need to account for the window dimension
-        window, local_idx = divmod(original_idx, self.num_ts)
-        global_idx = self.global_offset + local_idx  # This is the true GLOBAL dataset index
+        # For EvalDataset with weighting, each virtual sample gets a unique global index
+        # even if they map to the same physical time series across different windows
+        global_idx = self.global_offset + original_idx
         data['_dataset_idx'] = global_idx
-        # print(f"Eval - Window: {window}, Local idx: {local_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
+        # print(f"Eval - Original idx: {original_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
         return self.transform(self._flatten_data(data))

@@ -158,7 +158,7 @@ class ConcatDatasetBuilderWithGlobalIndex(DatasetBuilder):
             })
             
             log.info(f"Set global offset {current_offset} for dataset '{dataset_name}' with {dataset_size} samples (range: {current_offset}-{current_offset + dataset_size - 1})")
-            
+            log.info(f"Dataset ts_num: {dataset.num_ts}.")
             flattened.append(dataset)
             current_offset += dataset_size
         

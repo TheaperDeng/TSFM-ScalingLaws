@@ -174,10 +174,11 @@ def main(cfg: DictConfig):
     print("train_dataset:", train_dataset)
     print("val_dataset:", val_dataset)
     print("train_dataset size:", len(train_dataset))
-    print("val_dataset size:", len(val_dataset[0]), len(val_dataset[1]), len(val_dataset[2]))
+    # print("val_dataset size:", len(val_dataset[0]), len(val_dataset[1]), len(val_dataset[2]))
+    print("val_dataset size:", len(val_dataset[0]))
     trainer.fit(
         model,
-        datamodule=DataModule(cfg, train_dataset, [val_dataset[1]], data_builder),  # Pass data_builder
+        datamodule=DataModule(cfg, train_dataset, [val_dataset[0]], data_builder),  # Pass data_builder
         ckpt_path=cfg.ckpt_path,
     )
 

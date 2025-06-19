@@ -107,6 +107,8 @@ class TransformerEncoderPretrain(L.LightningModule):
         lr: float = 1e-3,
         weight_decay: float = 1e-2,
         log_on_step: bool = False,
+        num_low_influence_to_remove: int = 16,
+        enable_influence_scoring: bool = True,
     ):
         assert (module is not None) or (
             module_kwargs is not None
@@ -167,6 +169,14 @@ class TransformerEncoderPretrain(L.LightningModule):
     def training_step(
         self, batch: dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
+        # Filter out low-influence samples from batch if influence scoring is enabled
+        if self.hparams.enable_influence_scoring:
+            print(f"This batch originally has {len(batch['dataset_index'])} samples")
+            batch = self._filter_low_influence_samples(batch, num_to_remove=self.hparams.num_low_influence_to_remove)
+            print(f"This batch after filtering has {len(batch['dataset_index'])} samples")
+        else:
+            print(f"Influence scoring disabled - using full batch with {len(batch['dataset_index'])} samples")
+
         output = self(
             **{field: batch[field] for field in list(self.train_seq_fields) + ["sample_id"]}
         )
@@ -194,11 +204,16 @@ class TransformerEncoderPretrain(L.LightningModule):
         )
         return loss
     
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        """Calculate per-example gradients for influence function computation"""
+    def on_train_batch_start(self, batch, batch_idx):
+        """Calculate per-example gradients for influence function computation and filter low-influence samples"""
         
         # Only compute per-example gradients during training
         if not self.training:
+            return
+            
+        # Skip influence scoring if disabled
+        if not self.hparams.enable_influence_scoring:
+            print(f"Influence scoring disabled - skipping gradient computation for batch {batch_idx}")
             return
         
         # Get original dataset indices from the new field
@@ -221,10 +236,15 @@ class TransformerEncoderPretrain(L.LightningModule):
                 unique_indices = unique_indices[unique_indices < dataset_size]  # Filter out invalid indices
         
         print(f"Unique dataset indices in batch {batch_idx}: {unique_indices.tolist()}")
+        print(f"Unique dataset indices in batch {batch_idx} length: {len(unique_indices)}")
         
         # Initialize per-example gradient storage if not exists
         if not hasattr(self, 'per_example_gradients'):
             self.per_example_gradients = {}
+            
+        # Initialize influence score history if not exists
+        if not hasattr(self, 'influence_score_history'):
+            self.influence_score_history = {}
             
         # CLEAN UP: Remove any stale indices from previous runs on first batch
         if batch_idx == 0 and hasattr(self, 'per_example_gradients'):
@@ -257,7 +277,7 @@ class TransformerEncoderPretrain(L.LightningModule):
                 'gradients': sample_grads,
                 'step': self.global_step,
                 'epoch': self.current_epoch,
-                'loss': outputs
+                'loss': None  # We don't have outputs yet in on_train_batch_start
             })
 
         # directly calculate the influence scores on validation gradients
@@ -295,14 +315,125 @@ class TransformerEncoderPretrain(L.LightningModule):
         print("=" * 80)
 
         # save dataset_influence_scores to a csv file with header
-        with open('dataset_influence_scores.csv', 'a') as f:
+        with open('dataset_influence_scores_20250619.csv', 'a') as f:
             f.write("dataset_name,score,step,epoch,count\n")
             for dataset_name, score in dataset_influence_scores:
                 f.write(f"{dataset_name},{score},{self.global_step},{self.current_epoch},{count_dataset_scores[dataset_name]}\n")
             
+        # Update influence score history for future filtering
+        self._update_influence_score_history(influence_scores)
+        
         # clear the per-example gradients
         self.clear_per_example_gradients()
+
+    def _filter_low_influence_samples(self, batch, num_to_remove=16):
+        """Filter out samples with lowest influence scores from the current batch"""
         
+        # Skip filtering if influence scoring is disabled
+        if not self.hparams.enable_influence_scoring:
+            print("Influence scoring disabled - skipping batch filtering")
+            return batch
+            
+        if "dataset_index" not in batch:
+            print("Warning: No dataset_index found in batch, skipping filtering")
+            return batch
+        
+        dataset_indices = batch["dataset_index"]
+        batch_size, seq_len = dataset_indices.shape
+        
+        # Get unique dataset indices in this batch
+        unique_indices = dataset_indices.flatten().unique()
+        unique_indices = unique_indices[unique_indices >= 0]  # Remove padding (-1)
+        
+        if len(unique_indices) <= num_to_remove:
+            print(f"Batch has only {len(unique_indices)} unique samples, not removing any")
+            return batch
+        
+        # Get influence scores for samples in this batch
+        sample_scores = []
+        for idx in unique_indices:
+            idx_item = idx.item()
+            
+            # Get latest influence score for this sample
+            if (hasattr(self, 'influence_score_history') and 
+                idx_item in self.influence_score_history):
+                latest_score = self.influence_score_history[idx_item]
+                sample_scores.append((idx_item, latest_score))
+            else:
+                # If no history, assign neutral score (0.0)
+                sample_scores.append((idx_item, 0.0))
+                print(f"No influence score history found for sample {idx_item}")
+        
+        # Sort by influence score (ascending) and get the lowest scoring samples
+        sample_scores.sort(key=lambda x: x[1])
+        samples_to_remove = [idx for idx, score in sample_scores[:num_to_remove]]
+        
+        if len(samples_to_remove) == 0:
+            return batch
+        
+        print(f"Target: removing {num_to_remove} batch positions from low-influence samples: {samples_to_remove}")
+        print(f"Average influence score: {sum(score for _, score in sample_scores) / len(sample_scores)}")
+        print(f"Samples to remove average influence score: {sum(score for _, score in sample_scores[:num_to_remove]) / num_to_remove}")
+        
+        # Create mask for samples to keep
+        keep_mask = torch.ones(batch_size, dtype=torch.bool, device=dataset_indices.device)
+        
+        # Track how many batch positions we've removed
+        removed_count = 0
+        
+        for sample_idx in samples_to_remove:
+            if removed_count >= num_to_remove:
+                break
+                
+            # Find batch positions that contain this sample
+            sample_mask = (dataset_indices == sample_idx).any(dim=1)
+            sample_positions = sample_mask.nonzero().squeeze(1)
+            
+            # Remove only one instance of this sample (or fewer if we're at the limit)
+            positions_to_remove = min(len(sample_positions), num_to_remove - removed_count)
+            if positions_to_remove > 0:
+                keep_mask[sample_positions[:positions_to_remove]] = False
+                removed_count += positions_to_remove
+        
+        # Filter all tensors in the batch
+        filtered_batch = {}
+        for key, value in batch.items():
+            if torch.is_tensor(value):
+                if value.dim() > 0 and value.shape[0] == batch_size:
+                    # This tensor has batch dimension, filter it
+                    filtered_batch[key] = value[keep_mask]
+                else:
+                    # This tensor doesn't have batch dimension, keep as is
+                    filtered_batch[key] = value
+            else:
+                # Non-tensor values, keep as is
+                filtered_batch[key] = value
+        
+        original_batch_size = batch_size
+        new_batch_size = keep_mask.sum().item()
+        actual_removed = original_batch_size - new_batch_size
+        
+        print(f"Filtered batch size: {original_batch_size} -> {new_batch_size} (actually removed {actual_removed} positions)")
+        
+        return filtered_batch
+    
+    def _update_influence_score_history(self, influence_scores):
+        """Update the influence score history for batch filtering"""
+        
+        if not hasattr(self, 'influence_score_history'):
+            self.influence_score_history = {}
+        
+        # Process each sample's influence scores
+        for sample_idx, score_entries in influence_scores.items():
+            if len(score_entries) > 0:
+                # Use the most recent influence score for this sample
+                latest_score_entry = score_entries[-1]
+                influence_score = latest_score_entry['influence_score']
+                
+                # Store the latest influence score
+                self.influence_score_history[sample_idx] = influence_score
+        
+        print(f"Updated influence score history for {len(influence_scores)} samples")
 
     def _compute_per_sample_gradients_with_indices(self, batch, unique_indices):
         """Compute per-sample gradients for samples with specific dataset indices."""
@@ -452,7 +583,7 @@ class TransformerEncoderPretrain(L.LightningModule):
                         'influence_score': inner_product,
                         'step': grad_entry['step'],
                         'epoch': grad_entry['epoch'],
-                        'loss': grad_entry['loss']['loss'].item(),
+                        'loss': None,  # We don't have outputs yet in on_train_batch_start
                         'global_dataset_index': sample_idx  # Store the global index
                     }
                     
@@ -587,14 +718,14 @@ class TransformerEncoderPretrain(L.LightningModule):
                 # IMPORTANT: Remove dataset_index from validation batch to prevent contamination
                 # Validation dataset indices should NOT be used for influence computation
                 val_batch_clean = {k: v for k, v in val_batch.items() if k != 'dataset_index'}
-                if 'dataset_index' in val_batch:
-                    # Log warning about validation dataset index contamination
-                    val_indices = val_batch['dataset_index'].flatten().unique()
-                    val_indices_valid = val_indices[val_indices >= 0]
-                    if len(val_indices_valid) > 0 and batch_idx == 0:  # Only log once
-                        max_val_idx = val_indices_valid.max().item()
-                        print(f"INFO: Validation batch contains dataset indices up to {max_val_idx}")
-                        print(f"INFO: These indices are EXCLUDED from influence computation to prevent contamination")
+                # if 'dataset_index' in val_batch:
+                #     # Log warning about validation dataset index contamination
+                #     val_indices = val_batch['dataset_index'].flatten().unique()
+                #     val_indices_valid = val_indices[val_indices >= 0]
+                #     if len(val_indices_valid) > 0 and batch_idx == 0:  # Only log once
+                #         max_val_idx = val_indices_valid.max().item()
+                #         print(f"INFO: Validation batch contains dataset indices up to {max_val_idx}")
+                #         print(f"INFO: These indices are EXCLUDED from influence computation to prevent contamination")
                 
                 # Move tensors to device (consider CPU for very large models)
                 val_batch_clean = {
@@ -672,26 +803,33 @@ class TransformerEncoderPretrain(L.LightningModule):
         return val_gradients
 
     # Optional: Add memory management
-    def clear_per_example_gradients(self, keep_recent_steps=10):
+    # def clear_per_example_gradients(self, keep_recent_steps=1):
+    #     """Clear old per-example gradients to manage memory"""
+    #     if not hasattr(self, 'per_example_gradients'):
+    #         return
+        
+    #     current_step = self.global_step
+        
+    #     for sample_idx in list(self.per_example_gradients.keys()):
+    #         # Keep only recent gradients
+    #         recent_grads = [
+    #             grad_entry for grad_entry in self.per_example_gradients[sample_idx]
+    #             if current_step - grad_entry['step'] <= keep_recent_steps
+    #         ]
+            
+    #         if recent_grads:
+    #             self.per_example_gradients[sample_idx] = recent_grads
+    #         else:
+    #             del self.per_example_gradients[sample_idx]
+        
+    #     print(f"Cleared old gradients, keeping {keep_recent_steps} recent steps")
+
+    def clear_per_example_gradients(self, keep_recent_steps=None):
         """Clear old per-example gradients to manage memory"""
         if not hasattr(self, 'per_example_gradients'):
             return
         
-        current_step = self.global_step
-        
-        for sample_idx in list(self.per_example_gradients.keys()):
-            # Keep only recent gradients
-            recent_grads = [
-                grad_entry for grad_entry in self.per_example_gradients[sample_idx]
-                if current_step - grad_entry['step'] <= keep_recent_steps
-            ]
-            
-            if recent_grads:
-                self.per_example_gradients[sample_idx] = recent_grads
-            else:
-                del self.per_example_gradients[sample_idx]
-        
-        print(f"Cleared old gradients, keeping {keep_recent_steps} recent steps")
+        self.per_example_gradients = {}
 
     def validation_step(
         self, batch: dict[str, torch.Tensor], batch_idx: int, dataloader_idx: int = 0
@@ -901,7 +1039,7 @@ class TransformerEncoderPretrain(L.LightningModule):
                     variate_id_field="variate_id",
                     expected_ndim=3,
                     max_dim=self.hparams.max_dim,
-                    randomize=True,
+                    randomize=False,
                     collection_type=dict,
                 )
                 + AddTimeIndex(
@@ -1014,7 +1152,7 @@ class TransformerEncoderPretrain(L.LightningModule):
                     variate_id_field="variate_id",
                     expected_ndim=3,
                     max_dim=self.hparams.max_dim,
-                    randomize=True,
+                    randomize=False,
                     collection_type=dict,
                 )
                 + AddTimeIndex(
