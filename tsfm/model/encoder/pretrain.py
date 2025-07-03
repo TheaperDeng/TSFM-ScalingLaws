@@ -9,6 +9,9 @@ from jaxtyping import Bool, Float, Int
 from torch import nn
 from torch.distributions import Distribution
 import math
+import time
+from tsfm.data.augmentation import mixup
+import numpy as np
 
 from tsfm.loss.packed import (
     PackedDistributionLoss,
@@ -59,6 +62,8 @@ from tsfm.val.metrics import (
     CRPS
 )
 
+
+
 class TransformerEncoderPretrain(L.LightningModule):
     seq_fields: tuple[str, ...] = (
         "target",
@@ -108,7 +113,11 @@ class TransformerEncoderPretrain(L.LightningModule):
         weight_decay: float = 1e-2,
         log_on_step: bool = False,
         num_low_influence_to_remove: int = 16,
-        enable_influence_scoring: bool = True,
+        enable_influence_scoring: bool = False,
+        enable_dataset_contribution_logging: bool = False,
+        enable_reweighting: bool = False,
+        influence_filter_frequency: int = 1,  # temporary
+        use_cosine_similarity: bool = False,  # New parameter for cosine similarity
     ):
         assert (module is not None) or (
             module_kwargs is not None
@@ -120,6 +129,8 @@ class TransformerEncoderPretrain(L.LightningModule):
         self.save_hyperparameters(ignore=["module"])
         self.module = BasicModule(**module_kwargs) if module is None else module
         self.influence_scores = {}
+        self.recommended_weights = {}  # Initialize for recommended weights-based filtering
+        self.threshold = 4000
         
     def forward(
         self,
@@ -169,13 +180,34 @@ class TransformerEncoderPretrain(L.LightningModule):
     def training_step(
         self, batch: dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
-        # Filter out low-influence samples from batch if influence scoring is enabled
-        if self.hparams.enable_influence_scoring:
-            print(f"This batch originally has {len(batch['dataset_index'])} samples")
-            batch = self._filter_low_influence_samples(batch, num_to_remove=self.hparams.num_low_influence_to_remove)
-            print(f"This batch after filtering has {len(batch['dataset_index'])} samples")
+        # Determine whether to use influence-based or random filtering
+        current_step = self.global_step
+        use_influence_filtering = (current_step % self.hparams.influence_filter_frequency == 0) and self.hparams.enable_influence_scoring
+        
+        # Always apply some form of filtering (influence-based every N steps, random otherwise)
+        print(f"Step {current_step}: This batch originally has {len(batch['dataset_index'])} samples")
+        
+        if use_influence_filtering:
+            print(f"Step {current_step}: Using influence-based filtering (every {self.hparams.influence_filter_frequency} steps)")
+            batch = self._filter_low_influence_samples(
+                batch, 
+                num_to_remove=self.hparams.num_low_influence_to_remove, 
+                use_influence_scores=True
+            )
         else:
-            print(f"Influence scoring disabled - using full batch with {len(batch['dataset_index'])} samples")
+            # Determine filtering strategy based on available recommended weights
+            if hasattr(self, 'recommended_weights') and self.recommended_weights:
+                print(f"Step {current_step}: Using recommended weights-based filtering")
+            else:
+                print(f"Step {current_step}: Using random filtering (no recommended weights available yet)")
+            
+            batch = self._filter_low_influence_samples(
+                batch, 
+                num_to_remove=self.hparams.num_low_influence_to_remove, 
+                use_influence_scores=False
+            )
+        
+        print(f"Step {current_step}: This batch after filtering has {len(batch['dataset_index'])} samples")
 
         output = self(
             **{field: batch[field] for field in list(self.train_seq_fields) + ["sample_id"]}
@@ -206,14 +238,33 @@ class TransformerEncoderPretrain(L.LightningModule):
     
     def on_train_batch_start(self, batch, batch_idx):
         """Calculate per-example gradients for influence function computation and filter low-influence samples"""
+
+        # update influence_filter_frequency according to global_step
+        # increase the influence_filter_frequency by 1 every 1000 steps, then 2000, then 3000, ...
+        # self.hparams.influence_filter_frequency = int(self.global_step / self.threshold) + 1
+        # self.threshold = self.hparams.influence_filter_frequency * 1000
         
+        if self.global_step % self.threshold == self.threshold - 1:
+            self.hparams.influence_filter_frequency += 1
+            self.threshold = 1000 * (self.hparams.influence_filter_frequency) + self.threshold
+        print(f"Step {self.global_step}: Threshold updated to {self.threshold}")
+        print(f"Step {self.global_step}: Influence filter frequency updated to {self.hparams.influence_filter_frequency}")
+
         # Only compute per-example gradients during training
         if not self.training:
+            return
+        
+        # Only compute influence scores when influence-based filtering will be used
+        current_step = self.global_step
+        use_influence_filtering = (current_step % self.hparams.influence_filter_frequency == 0)
+        
+        if not use_influence_filtering:
+            print(f"Step {current_step}: Skipping influence computation (random filtering step)")
             return
             
         # Skip influence scoring if disabled
         if not self.hparams.enable_influence_scoring:
-            print(f"Influence scoring disabled - skipping gradient computation for batch {batch_idx}")
+            print(f"Step {current_step}: Influence scoring disabled - skipping gradient computation")
             return
         
         # Get original dataset indices from the new field
@@ -245,16 +296,6 @@ class TransformerEncoderPretrain(L.LightningModule):
         # Initialize influence score history if not exists
         if not hasattr(self, 'influence_score_history'):
             self.influence_score_history = {}
-            
-        # CLEAN UP: Remove any stale indices from previous runs on first batch
-        if batch_idx == 0 and hasattr(self, 'per_example_gradients'):
-            if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'train_dataset'):
-                dataset_size = len(self.trainer.datamodule.train_dataset)
-                stale_indices = [idx for idx in self.per_example_gradients.keys() if idx >= dataset_size]
-                for idx in stale_indices:
-                    del self.per_example_gradients[idx]
-                if stale_indices:
-                    print(f"CLEANUP: Cleared {len(stale_indices)} stale influence scores from previous runs")
         
         # Calculate per-sample gradients using original dataset indices
         per_sample_grads = self._compute_per_sample_gradients_with_indices(batch, unique_indices)
@@ -282,7 +323,7 @@ class TransformerEncoderPretrain(L.LightningModule):
 
         # directly calculate the influence scores on validation gradients
         val_gradients = self.get_validation_gradients_from_trainer()
-        influence_scores = self.compute_influence_scores(val_gradients)
+        influence_scores = self.compute_influence_scores_batched(val_gradients)
 
         # update the influence scores, but append the new scores to the end, don't overwrite the existing scores
         for sample_idx, scores in influence_scores.items():
@@ -291,49 +332,89 @@ class TransformerEncoderPretrain(L.LightningModule):
             else:
                 self.influence_scores[sample_idx] = scores
 
-        # aggregate the influence scores by dataset name
-        dataset_influence_scores = {}
-        count_dataset_scores = {}
-        for sample_idx, scores in self.influence_scores.items():
-            for score in scores:
-                dataset_name = score.get('dataset_name', 'Unknown')
-                if dataset_name not in dataset_influence_scores:
-                    dataset_influence_scores[dataset_name] = 0
-                    count_dataset_scores[dataset_name] = 0
-                # use running average to aggregate the influence scores
-                dataset_influence_scores[dataset_name] = (dataset_influence_scores[dataset_name] * count_dataset_scores[dataset_name] + score['influence_score']) / (count_dataset_scores[dataset_name] + 1)
-                count_dataset_scores[dataset_name] += 1
-        
-        # sort the dataset_influence_scores by the score
-        dataset_influence_scores = sorted(dataset_influence_scores.items(), key=lambda x: x[1], reverse=True)
-        
-        # print the dataset_influence_scores in order
-        print("=" * 80)
-        print("DATASET INFLUENCE SCORES:")
-        for dataset_name, score in dataset_influence_scores:
-            print(f"  {dataset_name:25} | Score: {score:10.4f} | Step: {self.global_step:6d} | Epoch: {self.current_epoch:6d} | Count: {count_dataset_scores[dataset_name]:6d}")
-        print("=" * 80)
+        # Clean up old influence scores to keep only recent 4000 steps
+        self._cleanup_old_influence_scores(keep_recent_steps=4000)
 
-        # save dataset_influence_scores to a csv file with header
-        with open('dataset_influence_scores_20250619.csv', 'a') as f:
-            f.write("dataset_name,score,step,epoch,count\n")
-            for dataset_name, score in dataset_influence_scores:
-                f.write(f"{dataset_name},{score},{self.global_step},{self.current_epoch},{count_dataset_scores[dataset_name]}\n")
+        # Only compute and log dataset contributions if dataset contribution logging is enabled
+        if self.hparams.enable_dataset_contribution_logging:
+            # aggregate the influence scores by dataset name
+            dataset_influence_scores = {}
+            count_dataset_scores = {}
+            for sample_idx, scores in self.influence_scores.items():
+                for score in scores:
+                    dataset_name = score.get('dataset_name', 'Unknown')
+                    if dataset_name not in dataset_influence_scores:
+                        dataset_influence_scores[dataset_name] = 0
+                        count_dataset_scores[dataset_name] = 0
+                    # use running average to aggregate the influence scores
+                    dataset_influence_scores[dataset_name] = (dataset_influence_scores[dataset_name] * count_dataset_scores[dataset_name] + score['influence_score']) / (count_dataset_scores[dataset_name] + 1)
+                    count_dataset_scores[dataset_name] += 1
             
+            # sort the dataset_influence_scores by the score
+            dataset_influence_scores = sorted(dataset_influence_scores.items(), key=lambda x: x[1], reverse=True)
+            
+            # print the dataset_influence_scores in order
+            print("=" * 80)
+            print("DATASET INFLUENCE SCORES:")
+            for dataset_name, score in dataset_influence_scores:
+                print(f"  {dataset_name:25} | Score: {score:10.4f} | Step: {self.global_step:6d} | Epoch: {self.current_epoch:6d} | Count: {count_dataset_scores[dataset_name]:6d}")
+            print("=" * 80)
+
+            # # save dataset_influence_scores to a csv file with header
+            # with open('dataset_influence_scores_20250619.csv', 'a') as f:
+            #     f.write("dataset_name,score,step,epoch,count\n")
+            #     for dataset_name, score in dataset_influence_scores:
+            #         f.write(f"{dataset_name},{score},{self.global_step},{self.current_epoch},{count_dataset_scores[dataset_name]}\n")
+        else:
+            print("Dataset contribution logging disabled (enable_dataset_contribution_logging=False)")
+
+        if self.hparams.enable_reweighting:
+            # Calculate updated sampling ratios based on dataset influence scores
+
+            scores = np.array([score for _, score in dataset_influence_scores])
+            dataset_names = [name for name, _ in dataset_influence_scores]
+            
+            # Method 1: Linear scaling (more conservative)
+            # Normalize to [0.1, 2.0] range to avoid extreme ratios
+            if scores.max() > scores.min():
+                normalized_scores = (scores - scores.min()) / (scores.max() - scores.min())
+                linear_ratios = 0.1 + 1.9 * normalized_scores  # Scale to [0.1, 2.0]
+                linear_ratios = linear_ratios / linear_ratios.mean()  # Normalize so mean = 1.0
+            else:
+                linear_ratios = np.ones(len(scores))  # All equal if no variation
+            
+            # Create sampling ratio dictionary
+            sampling_ratios = {}
+            for i, dataset_name in enumerate(dataset_names):
+                sampling_ratios[dataset_name] = {
+                    'influence_score': scores[i],
+                    'linear_ratio': float(linear_ratios[i]),
+                    'count': count_dataset_scores[dataset_name]
+                }
+            
+            # Store sampling ratios for potential use by external components
+            self.latest_sampling_ratios = sampling_ratios
+            
+            # Option: Use linear ratios as the recommended sampling weights
+            recommended_weights = {name: info['linear_ratio'] for name, info in sampling_ratios.items()}
+            print(f"Recommended sampling weights: {recommended_weights}")
+            
+            # Save recommended weights as member variable for future filtering rounds
+            self.recommended_weights = recommended_weights
+            
+            # Dataset weights calculation completed - weights not applied to maintain decoupling
+        else:
+            print("Dataset reweighting disabled (enable_reweighting=False)")
+
         # Update influence score history for future filtering
         self._update_influence_score_history(influence_scores)
-        
+
         # clear the per-example gradients
         self.clear_per_example_gradients()
-
-    def _filter_low_influence_samples(self, batch, num_to_remove=16):
-        """Filter out samples with lowest influence scores from the current batch"""
         
-        # Skip filtering if influence scoring is disabled
-        if not self.hparams.enable_influence_scoring:
-            print("Influence scoring disabled - skipping batch filtering")
-            return batch
-            
+    def _filter_low_influence_samples(self, batch, num_to_remove=16, use_influence_scores=True):
+        """Filter out samples from the current batch using influence scores or random selection"""
+        
         if "dataset_index" not in batch:
             print("Warning: No dataset_index found in batch, skipping filtering")
             return batch
@@ -349,32 +430,92 @@ class TransformerEncoderPretrain(L.LightningModule):
             print(f"Batch has only {len(unique_indices)} unique samples, not removing any")
             return batch
         
-        # Get influence scores for samples in this batch
-        sample_scores = []
-        for idx in unique_indices:
-            idx_item = idx.item()
-            
-            # Get latest influence score for this sample
-            if (hasattr(self, 'influence_score_history') and 
-                idx_item in self.influence_score_history):
-                latest_score = self.influence_score_history[idx_item]
-                sample_scores.append((idx_item, latest_score))
+        if use_influence_scores:
+            # Use influence-based filtering (original behavior)
+            if not self.hparams.enable_influence_scoring:
+                print("Warning: Influence scoring disabled but influence-based filtering requested, using random filtering instead")
+                use_influence_scores = False
             else:
-                # If no history, assign neutral score (0.0)
-                sample_scores.append((idx_item, 0.0))
-                print(f"No influence score history found for sample {idx_item}")
+                # Get influence scores for samples in this batch
+                sample_scores = []
+                for idx in unique_indices:
+                    idx_item = idx.item()
+                    
+                    # Get latest influence score for this sample
+                    if (hasattr(self, 'influence_score_history') and 
+                        idx_item in self.influence_score_history):
+                        latest_score = self.influence_score_history[idx_item]
+                        sample_scores.append((idx_item, latest_score))
+                    else:
+                        # If no history, assign neutral score (0.0)
+                        sample_scores.append((idx_item, 0.0))
+                        print(f"No influence score history found for sample {idx_item}")
+                
+                # Sort by influence score (ascending) and get the lowest scoring samples
+                sample_scores.sort(key=lambda x: x[1])
+                samples_to_remove = [idx for idx, score in sample_scores[:num_to_remove]]
+                
+                print(f"Influence-based filtering: removing {num_to_remove} batch positions from low-influence samples: {samples_to_remove}")
+                print(f"Average influence score: {sum(score for _, score in sample_scores) / len(sample_scores)}")
+                print(f"Samples to remove average influence score: {sum(score for _, score in sample_scores[:num_to_remove]) / num_to_remove}")
         
-        # Sort by influence score (ascending) and get the lowest scoring samples
-        sample_scores.sort(key=lambda x: x[1])
-        samples_to_remove = [idx for idx, score in sample_scores[:num_to_remove]]
+        if not use_influence_scores:
+            # Use recommended weights-based filtering if available, otherwise random filtering
+            if hasattr(self, 'recommended_weights') and self.recommended_weights:
+                # Get dataset names and weights for samples in this batch
+                sample_weights = []
+                for idx in unique_indices:
+                    idx_item = idx.item()
+                    dataset_name = self._get_dataset_name_for_index(idx_item)
+                    weight = self.recommended_weights.get(dataset_name, 1.0)  # Default to 1.0 if not found
+                    sample_weights.append((idx_item, weight, dataset_name))
+                
+                # Use probabilistic sampling based on inverse weights to maintain diversity
+                # Lower weights = higher probability of removal, but still maintains randomness
+                import numpy as np
+                
+                # Extract weights and indices
+                indices = [idx for idx, weight, dataset_name in sample_weights]
+                weights = np.array([weight for idx, weight, dataset_name in sample_weights])
+                dataset_names = [dataset_name for idx, weight, dataset_name in sample_weights]
+                
+                # Calculate removal probabilities (inverse of weights, normalized)
+                # Add small epsilon to avoid division by zero
+                epsilon = 1e-6
+                inverse_weights = 1.0 / (weights + epsilon)
+                removal_probs = inverse_weights / inverse_weights.sum()
+                
+                # Sample indices to remove based on probabilities
+                try:
+                    selected_indices = np.random.choice(
+                        len(indices), 
+                        size=min(num_to_remove, len(indices)), 
+                        replace=False, 
+                        p=removal_probs
+                    )
+                    samples_to_remove = [indices[i] for i in selected_indices]
+                    
+                    print(f"Recommended weights-based filtering: probabilistically removing {len(samples_to_remove)} batch positions")
+                    for i in selected_indices:
+                        idx, weight, dataset_name = indices[i], weights[i], dataset_names[i]
+                        prob = removal_probs[i]
+                        print(f"  Removing sample {idx} from {dataset_name} (weight: {weight:.3f}, removal_prob: {prob:.3f})")
+                        
+                except Exception as e:
+                    print(f"Error in probabilistic sampling: {e}, falling back to random selection")
+                    import random
+                    samples_to_remove = random.sample(indices, min(num_to_remove, len(indices)))
+            else:
+                # Fallback to random filtering if no recommended weights available
+                import random
+                unique_indices_list = unique_indices.cpu().numpy().tolist()
+                samples_to_remove = random.sample(unique_indices_list, min(num_to_remove, len(unique_indices_list)))
+                
+                print(f"Random filtering (no recommended weights available): removing {len(samples_to_remove)} batch positions from randomly selected samples: {samples_to_remove}")
         
         if len(samples_to_remove) == 0:
             return batch
-        
-        print(f"Target: removing {num_to_remove} batch positions from low-influence samples: {samples_to_remove}")
-        print(f"Average influence score: {sum(score for _, score in sample_scores) / len(sample_scores)}")
-        print(f"Samples to remove average influence score: {sum(score for _, score in sample_scores[:num_to_remove]) / num_to_remove}")
-        
+
         # Create mask for samples to keep
         keep_mask = torch.ones(batch_size, dtype=torch.bool, device=dataset_indices.device)
         
@@ -413,7 +554,15 @@ class TransformerEncoderPretrain(L.LightningModule):
         new_batch_size = keep_mask.sum().item()
         actual_removed = original_batch_size - new_batch_size
         
-        print(f"Filtered batch size: {original_batch_size} -> {new_batch_size} (actually removed {actual_removed} positions)")
+        # Determine filter type for logging
+        if use_influence_scores:
+            filter_type = "influence-based"
+        elif hasattr(self, 'recommended_weights') and self.recommended_weights:
+            filter_type = "recommended weights-based"
+        else:
+            filter_type = "random"
+        
+        print(f"Filtered batch size ({filter_type}): {original_batch_size} -> {new_batch_size} (actually removed {actual_removed} positions)")
         
         return filtered_batch
     
@@ -434,6 +583,52 @@ class TransformerEncoderPretrain(L.LightningModule):
                 self.influence_score_history[sample_idx] = influence_score
         
         print(f"Updated influence score history for {len(influence_scores)} samples")
+
+    def _cleanup_old_influence_scores(self, keep_recent_steps=1600):
+        """Clean up old influence scores to keep only recent steps for memory management"""
+        
+        if not hasattr(self, 'influence_scores') or not self.influence_scores:
+            return
+        
+        current_step = self.global_step
+        cutoff_step = current_step - keep_recent_steps
+        
+        # Count entries before cleanup
+        total_entries_before = sum(len(scores) for scores in self.influence_scores.values())
+        samples_before = len(self.influence_scores)
+        
+        # Clean up old entries from each sample's influence scores
+        samples_to_remove = []
+        
+        for sample_idx, score_entries in self.influence_scores.items():
+            # Filter out old entries based on step
+            recent_entries = [
+                entry for entry in score_entries 
+                if entry.get('step', 0) > cutoff_step
+            ]
+            
+            if recent_entries:
+                # Keep only recent entries
+                self.influence_scores[sample_idx] = recent_entries
+            else:
+                # Mark sample for removal if no recent entries
+                samples_to_remove.append(sample_idx)
+        
+        # Remove samples with no recent entries
+        for sample_idx in samples_to_remove:
+            del self.influence_scores[sample_idx]
+        
+        # Count entries after cleanup
+        total_entries_after = sum(len(scores) for scores in self.influence_scores.values())
+        samples_after = len(self.influence_scores)
+        
+        entries_removed = total_entries_before - total_entries_after
+        samples_removed = samples_before - samples_after
+        
+        if entries_removed > 0 or samples_removed > 0:
+            print(f"Cleaned up influence scores: removed {entries_removed} old entries from {samples_removed} samples")
+            print(f"Kept influence scores from step {cutoff_step + 1} onwards (recent {keep_recent_steps} steps)")
+            print(f"Remaining: {total_entries_after} entries across {samples_after} samples")
 
     def _compute_per_sample_gradients_with_indices(self, batch, unique_indices):
         """Compute per-sample gradients for samples with specific dataset indices."""
@@ -460,6 +655,7 @@ class TransformerEncoderPretrain(L.LightningModule):
             
             if len(batch_indices) == 0:
                 # No data for this index, store None
+                print(f"WARNING: No data for dataset index {dataset_idx}, skipping...")
                 for name, param in self.named_parameters():
                     if param.requires_grad:
                         per_sample_grads[name].append(None)
@@ -564,23 +760,42 @@ class TransformerEncoderPretrain(L.LightningModule):
             for grad_entry in grad_history:
                 train_grads = grad_entry['gradients']
                 
-                # Compute inner product with validation gradients
-                inner_product = 0.0
+                # Compute inner product or cosine similarity with validation gradients
+                similarity_score = 0.0
                 param_count = 0
                 
-                for param_name in train_grads:
-                    if param_name in val_gradients and train_grads[param_name] is not None:
-                        train_grad = train_grads[param_name].flatten()
-                        val_grad = val_gradients[param_name].flatten()
-                        
-                        # Ensure same size
-                        if train_grad.shape == val_grad.shape:
-                            inner_product += torch.dot(train_grad, val_grad).item()
-                            param_count += 1
+                if self.hparams.use_cosine_similarity:
+                    # Compute cosine similarity for each parameter separately and average
+                    for param_name in train_grads:
+                        if param_name in val_gradients and train_grads[param_name] is not None:
+                            train_grad = train_grads[param_name].flatten()
+                            val_grad = val_gradients[param_name].flatten()
+                            
+                            # Ensure same size
+                            if train_grad.shape == val_grad.shape:
+                                # Compute cosine similarity: cos(θ) = (A·B) / (||A|| * ||B||)
+                                train_norm = torch.norm(train_grad)
+                                val_norm = torch.norm(val_grad)
+                                
+                                if train_norm > 0 and val_norm > 0:
+                                    cosine_sim = torch.dot(train_grad, val_grad) / (train_norm * val_norm)
+                                    similarity_score += cosine_sim.item()
+                                    param_count += 1
+                else:
+                    # Original dot product computation
+                    for param_name in train_grads:
+                        if param_name in val_gradients and train_grads[param_name] is not None:
+                            train_grad = train_grads[param_name].flatten()
+                            val_grad = val_gradients[param_name].flatten()
+                            
+                            # Ensure same size
+                            if train_grad.shape == val_grad.shape:
+                                similarity_score += torch.dot(train_grad, val_grad).item()
+                                param_count += 1
                 
                 if param_count > 0:
                     score_entry = {
-                        'influence_score': inner_product,
+                        'influence_score': similarity_score,
                         'step': grad_entry['step'],
                         'epoch': grad_entry['epoch'],
                         'loss': None,  # We don't have outputs yet in on_train_batch_start
@@ -600,13 +815,122 @@ class TransformerEncoderPretrain(L.LightningModule):
         
         return influence_scores
     
+    def compute_influence_scores_batched(self, val_gradients):
+        """Compute influence scores using batched operations for major speedup"""
+        if not hasattr(self, 'per_example_gradients'):
+            print("No per-example gradients stored")
+            return {}
+        
+        if not val_gradients:
+            print("No validation gradients provided")
+            return {}
+        
+        # Pre-process validation gradients - get consistent parameter order
+        param_names = sorted([n for n in val_gradients.keys() if val_gradients[n] is not None])
+        if not param_names:
+            print("No valid validation gradients found")
+            return {}
+        
+        val_grad_flat = torch.cat([val_gradients[name].flatten() for name in param_names])
+        device = val_grad_flat.device
+        
+        # Collect all training gradients into batches
+        all_sample_indices = []
+        all_train_grads = []
+        all_metadata = []
+        
+        for sample_idx, grad_history in self.per_example_gradients.items():
+            for grad_entry in grad_history:
+                train_grads = grad_entry['gradients']
+                
+                # Check if all required gradients exist and are valid
+                valid_grads = []
+                valid = True
+                
+                for name in param_names:
+                    if name in train_grads and train_grads[name] is not None:
+                        valid_grads.append(train_grads[name].flatten())
+                    else:
+                        valid = False
+                        break
+                
+                if valid and len(valid_grads) == len(param_names):
+                    try:
+                        train_grad_flat = torch.cat(valid_grads)
+                        # Ensure same device
+                        train_grad_flat = train_grad_flat.to(device)
+                        
+                        all_sample_indices.append(sample_idx)
+                        all_train_grads.append(train_grad_flat)
+                        all_metadata.append(grad_entry)
+                    except Exception as e:
+                        print(f"Warning: Could not process gradients for sample {sample_idx}: {e}")
+                        continue
+        
+        if not all_train_grads:
+            print("No valid training gradients found for batch processing")
+            return {}
+        
+        print(f"Batch processing influence scores for {len(all_train_grads)} gradient entries...")
+        
+        try:
+            # Stack into matrix: [num_samples, num_params]
+            train_grad_matrix = torch.stack(all_train_grads)
+            
+            if self.hparams.use_cosine_similarity:
+                # Normalize training gradients (each row)
+                train_grad_norms = torch.norm(train_grad_matrix, dim=1, keepdim=True)
+                # Avoid division by zero
+                train_grad_norms = torch.clamp(train_grad_norms, min=1e-8)
+                train_grad_matrix_normalized = train_grad_matrix / train_grad_norms
+                
+                # Normalize validation gradients
+                val_grad_norm = torch.norm(val_grad_flat)
+                val_grad_norm = torch.clamp(val_grad_norm, min=1e-8)
+                val_grad_flat_normalized = val_grad_flat / val_grad_norm
+                
+                # Compute cosine similarity: [num_samples]
+                influence_scores_flat = torch.matmul(train_grad_matrix_normalized, val_grad_flat_normalized)
+            else:
+                # Original dot product computation: [num_samples]
+                influence_scores_flat = torch.matmul(train_grad_matrix, val_grad_flat)
+            
+            # Process results back into the expected format
+            influence_scores = {}
+            for i, (sample_idx, metadata) in enumerate(zip(all_sample_indices, all_metadata)):
+                score_entry = {
+                    'influence_score': influence_scores_flat[i].item(),
+                    'step': metadata['step'],
+                    'epoch': metadata['epoch'],
+                    'loss': metadata.get('loss', None),
+                    'global_dataset_index': sample_idx
+                }
+                
+                # Try to add dataset name
+                try:
+                    score_entry['dataset_name'] = self._get_dataset_name_for_index(sample_idx)
+                except Exception as e:
+                    score_entry['dataset_name'] = f"Unknown_Idx_{sample_idx}"
+                
+                if sample_idx not in influence_scores:
+                    influence_scores[sample_idx] = []
+                influence_scores[sample_idx].append(score_entry)
+            
+            print(f"Successfully computed influence scores for {len(influence_scores)} unique samples")
+            return influence_scores
+            
+        except Exception as e:
+            print(f"Error in batched influence computation: {e}")
+            print("Falling back to original method...")
+            return self.compute_influence_scores(val_gradients)
+    
     def _get_dataset_name_for_index(self, global_idx: int) -> str:
         """Helper method to get dataset name for a global index."""
         try:
             # BOUNDS CHECK: Validate global_idx is within reasonable range
-            max_dataset_size = 20000  # Reasonable upper bound
-            if global_idx > max_dataset_size:
-                print(f"WARNING: Global index {global_idx} exceeds reasonable bounds (>{max_dataset_size}). This might indicate stale influence scores.")
+            dataset_size = len(self.trainer.datamodule.train_dataset)  # Reasonable upper bound
+            if global_idx > dataset_size:
+                print(f"WARNING: Global index {global_idx} exceeds reasonable bounds (>{dataset_size}). This might indicate stale influence scores.")
                 return f"OutOfBounds_Idx_{global_idx}"
             
             # Method 1: Try to use ConcatDatasetBuilderWithGlobalIndex metadata (preferred)
@@ -690,18 +1014,19 @@ class TransformerEncoderPretrain(L.LightningModule):
         self.zero_grad()
         
         # Handle both dataset and dataloader inputs
-        if hasattr(dataloader_or_dataset, '__iter__') and hasattr(dataloader_or_dataset, '__len__'):
-            # It's a dataloader
-            val_dataloader = dataloader_or_dataset
-        else:
-            # It's a dataset, create dataloader
-            from torch.utils.data import DataLoader
-            val_dataloader = DataLoader(
-                dataloader_or_dataset,
-                batch_size=32,  # Smaller batch size for memory efficiency
-                shuffle=False,
-                collate_fn=getattr(dataloader_or_dataset, 'collate_fn', None)
-            )
+        val_dataloader = dataloader_or_dataset
+        # if hasattr(dataloader_or_dataset, '__iter__') and hasattr(dataloader_or_dataset, '__len__'):
+        #     # It's a dataloader
+        #     val_dataloader = dataloader_or_dataset
+        # else:
+        #     # It's a dataset, create dataloader
+        #     from torch.utils.data import DataLoader
+        #     val_dataloader = DataLoader(
+        #         dataloader_or_dataset,
+        #         batch_size=32,  # Smaller batch size for memory efficiency
+        #         shuffle=False,
+        #         collate_fn=getattr(dataloader_or_dataset, 'collate_fn', None)
+        #     )
         
         total_samples = 0
         accumulated_gradients = {}
@@ -801,28 +1126,6 @@ class TransformerEncoderPretrain(L.LightningModule):
         print(f"Computed validation gradients for {len(val_gradients)} parameters over {total_samples} samples")
         
         return val_gradients
-
-    # Optional: Add memory management
-    # def clear_per_example_gradients(self, keep_recent_steps=1):
-    #     """Clear old per-example gradients to manage memory"""
-    #     if not hasattr(self, 'per_example_gradients'):
-    #         return
-        
-    #     current_step = self.global_step
-        
-    #     for sample_idx in list(self.per_example_gradients.keys()):
-    #         # Keep only recent gradients
-    #         recent_grads = [
-    #             grad_entry for grad_entry in self.per_example_gradients[sample_idx]
-    #             if current_step - grad_entry['step'] <= keep_recent_steps
-    #         ]
-            
-    #         if recent_grads:
-    #             self.per_example_gradients[sample_idx] = recent_grads
-    #         else:
-    #             del self.per_example_gradients[sample_idx]
-        
-    #     print(f"Cleared old gradients, keeping {keep_recent_steps} recent steps")
 
     def clear_per_example_gradients(self, keep_recent_steps=None):
         """Clear old per-example gradients to manage memory"""
