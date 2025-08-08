@@ -148,19 +148,25 @@ class ConcatDatasetBuilderWithGlobalIndex(DatasetBuilder):
                 dataset_name = self._get_dataset_name(builder, dataset)
             
             # Store range metadata for this dataset
-            dataset_size = len(dataset)
+            # Use num_ts (actual time series count) instead of len(dataset) (weighted count)
+            # because the dataset classes use modulo num_ts for global_idx calculation
+            if hasattr(dataset, 'num_ts'):
+                actual_size = dataset.num_ts
+            else:
+                actual_size = len(dataset)  # fallback for datasets without num_ts
+                
             self.dataset_ranges.append({
                 'global_start': current_offset,
-                'global_end': current_offset + dataset_size - 1,
-                'size': dataset_size,
+                'global_end': current_offset + actual_size - 1,
+                'size': actual_size,
                 'dataset_name': dataset_name,
                 'builder_type': builder.__class__.__name__ if builder else 'Unknown'
             })
             
-            log.info(f"Set global offset {current_offset} for dataset '{dataset_name}' with {dataset_size} samples (range: {current_offset}-{current_offset + dataset_size - 1})")
-            log.info(f"Dataset ts_num: {dataset.num_ts}.")
+            log.info(f"Set global offset {current_offset} for dataset '{dataset_name}' with {actual_size} samples (range: {current_offset}-{current_offset + actual_size - 1})")
+            log.info(f"Dataset ts_num: {getattr(dataset, 'num_ts', 'N/A')}.")
             flattened.append(dataset)
-            current_offset += dataset_size
+            current_offset += actual_size
         
         return flattened, current_offset
 

@@ -10,6 +10,7 @@ from torch import nn
 from torch.distributions import Distribution
 import math
 import time
+from tsfm.data.augmentation import mixup
 import numpy as np
 
 from tsfm.loss.packed import (
@@ -130,8 +131,6 @@ class TransformerEncoderPretrain(L.LightningModule):
         self.influence_scores = {}
         self.recommended_weights = {}  # Initialize for recommended weights-based filtering
         self.threshold = 4000
-        self.generation_model = None  # Placeholder for generation model
-        self.generation_data = None  # Placeholder for generation data
         self.cache_val_batch = None  # This is used to cache the validation batch for TS influence scoring
         
     def forward(
@@ -196,16 +195,6 @@ class TransformerEncoderPretrain(L.LightningModule):
                 num_to_remove=self.hparams.num_low_influence_to_remove, 
                 use_influence_scores=True
             )
-            generated_batch = self._generated_similar_samples(batch)
-
-            # merge the generated batch with the original batch
-            batch = self._merge_batches(batch, generated_batch)
-
-            # gen_grad = self._compute_per_sample_gradients_with_indices(generated_batch, generated_batch["_dataset_idx"])
-            # val_gradients = self.get_validation_gradients_from_trainer()
-            # print("Complete the gradient calculation of generated samples")
-            # # print("Type: {}, {}".format(type(val_gradients), type(gen_grad)))
-
         else:
             # Determine filtering strategy based on available recommended weights
             if hasattr(self, 'recommended_weights') and self.recommended_weights:
@@ -247,141 +236,20 @@ class TransformerEncoderPretrain(L.LightningModule):
             rank_zero_only=True,
         )
         return loss
-
-    def _merge_batches(self, original_batch, generated_batch):
-        """Merge the generated batch with the original batch"""
-        for key in original_batch.keys():
-            assert key in generated_batch, f"Key {key} not found in generated batch"
-            original_batch[key] = torch.cat((original_batch[key], generated_batch[key]), dim=0)
-        return original_batch
-
-    def _generated_similar_samples(self, batch, num_samples=16):
-        print("Generating similar samples for influence scoring...")
-        # for key, value in batch.items():
-        #     print(key, value.shape, value[0])
-        # print(batch["sample_id"])
-        prompt_list = self._crop_sample_from_patches(batch)
-
-        # load the model and datamodule for generation
-        import sys
-        sys.path.append("/home/v-junweideng/online-ts-aug/TSFM-ScalingLaws/generation")
-        from generate_batch_preview import generate_conditional_batch, load_model
-        if self.generation_model is None or self.generation_data is None:
-            ckpt_path = "/home/v-junweideng/online-ts-aug/TSFM-ScalingLaws/generation/000060-0.0853.ckpt"
-            generation_model, self.generation_data = load_model(ckpt_path, seed=0)
-            object.__setattr__(self, 'generation_model', generation_model)
-        
-        # print("prompt list length:", len(prompt_list))
-        generated_samples_list = []
-        dataset_names_list = []
-        subset_id_list = []
-        new_prompt_list = []
-        for idx in range(len(prompt_list)):
-            dataset_name = self._get_dataset_name_for_index(batch["_dataset_idx"][idx].item())
-            print(dataset_name,
-                  prompt_list[idx].shape if prompt_list is not None else None)
-            if dataset_name not in self.generation_data.key_list:
-                print(f"Dataset {dataset_name} not found in generation data, skipping...")
-                continue
-            dataset_names_list.append(dataset_name)
-            new_prompt_list.append(prompt_list[idx])
-
-            subset_id = self.generation_data.key_list.index(dataset_name)
-            subset_id_list.append(subset_id)
-
-        generated_samples = generate_conditional_batch(
-            prompt=new_prompt_list,
-            subset_id=subset_id_list,
-            model=self.generation_model,
-            dataset_name=dataset_names_list,
-            data_module=self.generation_data,
-            num_samples=1,  # generation 1:1
-            ddim=False,
-            ddim_steps=40,
-            dataset_idx=(-batch["_dataset_idx"]).tolist(),
-        )
-        
-        # print("Generated samples length:", len(generated_samples))
-        # print(generated_samples['label'].shape)
-        # for key, value in generated_samples.items():
-        #     print(key, value.shape, value[0].device)
-        
-        # mv generated_samples to the same device as the model
-        device = "cuda"
-        for key, value in generated_samples.items():
-            if isinstance(value, torch.Tensor):
-                generated_samples[key] = value.to(device)
-
-        return generated_samples
-
-    def _crop_sample_from_patches(self, batch, target_length=320, patch_size=32):
-        """Crop a sample from the patches in the batch to match the target length"""
-
-        # calculate the number of patches to crop
-        num_patches = target_length // patch_size
-
-        label = batch["label"]  # [16, 512, 32]
-        batch_size, total_patches, patch_dim = label.shape
-
-        # check number of available patches using label_observed_mask
-        label_observed_mask = batch["label_observed_mask"]  # [16, 512, 32]
-        
-        # Get the availability mask by checking if any element in the patch dimension is observed
-        # This assumes that if a patch is available, all elements in that patch should be 1
-        patch_available_mask = label_observed_mask.any(dim=-1)  # [16, 512] - True where patches are available
-
-        # random sample consecutive patches from the label with length=num_patches
-        if num_patches > 0:
-            cropped_samples_list = []
-            
-            for batch_idx in range(batch_size):
-                # Find available patches for this batch item
-                available_patches = patch_available_mask[batch_idx]  # [512]
-                num_available = available_patches.sum().item()
-                
-                if num_available >= num_patches:
-                    # Find the range of available patches (assuming they are consecutive from start)
-                    available_indices = torch.where(available_patches)[0]  # Get indices where patches are available
-                    
-                    if len(available_indices) >= num_patches:
-                        # Check if we can find consecutive patches
-                        max_start_for_consecutive = available_indices[-num_patches].item() if len(available_indices) >= num_patches else 0
-                        min_start = available_indices[0].item()
-                        
-                        # Randomly select a starting position that ensures num_patches consecutive available patches
-                        if max_start_for_consecutive >= min_start:
-                            start_idx = torch.randint(min_start, max_start_for_consecutive + 1, (1,), device=label.device).item()
-                        else:
-                            start_idx = min_start
-                        
-                        # Extract consecutive patches
-                        end_idx = start_idx + num_patches
-                        patch_indices = torch.arange(start_idx, end_idx, device=label.device)
-                        
-                        # Get the patches for this batch item
-                        selected_patches = label[batch_idx, patch_indices]  # [num_patches, patch_dim]
-                        cropped_sample = selected_patches.reshape(-1)  # [target_length]
-                    else:
-                        # Not enough available patches, return zeros
-                        cropped_sample = None
-                else:
-                    # Not enough available patches, return zeros
-                    cropped_sample = None
-                
-                cropped_samples_list.append(cropped_sample)
-            
-            # Stack all batch items
-            # cropped_samples = torch.stack(cropped_samples_list, dim=0)  # [batch_size, target_length]
-            
-            # remove all the None in the cropped_samples_list
-            cropped_samples_list = [sample for sample in cropped_samples_list if sample is not None]
-            return cropped_samples_list
-        else:
-            # If num_patches is 0 or exceeds available patches, return zeros
-            return None
-            
+    
     def on_train_batch_start(self, batch, batch_idx):
         """Calculate per-example gradients for influence function computation and filter low-influence samples"""
+
+        # update influence_filter_frequency according to global_step
+        # increase the influence_filter_frequency by 1 every 1000 steps, then 2000, then 3000, ...
+        # self.hparams.influence_filter_frequency = int(self.global_step / self.threshold) + 1
+        # self.threshold = self.hparams.influence_filter_frequency * 1000
+        
+        # if self.global_step % self.threshold == self.threshold - 1:
+        #     self.hparams.influence_filter_frequency += 1
+        #     self.threshold = 1000 * (self.hparams.influence_filter_frequency) + self.threshold
+        # print(f"Step {self.global_step}: Threshold updated to {self.threshold}")
+        # print(f"Step {self.global_step}: Influence filter frequency updated to {self.hparams.influence_filter_frequency}")
 
         # Only compute per-example gradients during training
         if not self.training:
@@ -411,7 +279,15 @@ class TransformerEncoderPretrain(L.LightningModule):
         unique_indices = dataset_indices.flatten().unique()
         unique_indices = unique_indices[unique_indices >= 0]  # Remove padding (-1)
         
-        # print(f"Unique dataset indices in batch {batch_idx}: {unique_indices.tolist()}")
+        # BOUNDS CHECK: Validate indices are within dataset range
+        if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'train_dataset'):
+            dataset_size = len(self.trainer.datamodule.train_dataset)
+            invalid_indices = unique_indices[unique_indices >= dataset_size]
+            if len(invalid_indices) > 0:
+                print(f"WARNING: Found invalid indices {invalid_indices.tolist()} >= dataset size {dataset_size} in batch {batch_idx}")
+                unique_indices = unique_indices[unique_indices < dataset_size]  # Filter out invalid indices
+        
+        print(f"Unique dataset indices in batch {batch_idx}: {unique_indices.tolist()}")
         print(f"Unique dataset indices in batch {batch_idx} length: {len(unique_indices)}")
         
         # Initialize per-example gradient storage if not exists
@@ -534,14 +410,15 @@ class TransformerEncoderPretrain(L.LightningModule):
         # Update influence score history for future filtering
         self._update_influence_score_history(influence_scores)
 
-        # clear the per-example gradients
+        # # clear the per-example gradients
+        # self.clear_per_example_gradients()
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """Clear per-example gradients after training step"""
         self.clear_per_example_gradients()
-        
+
     def _filter_low_influence_samples(self, batch, num_to_remove=16, use_influence_scores=True):
         """Filter out samples from the current batch using influence scores or random selection"""
-
-        # use_influence_scores = True, then we use influence score filtering
-        # use_influence_scores = False, then we use recommended weights-based filtering or random filtering
         
         if "dataset_index" not in batch:
             print("Warning: No dataset_index found in batch, skipping filtering")
@@ -636,9 +513,8 @@ class TransformerEncoderPretrain(L.LightningModule):
             else:
                 # Fallback to random filtering if no recommended weights available
                 import random
-                # unique_indices_list = unique_indices.cpu().numpy().tolist()
-                # samples_to_remove = random.sample(unique_indices_list, min(num_to_remove, len(unique_indices_list)))
-                samples_to_remove = []
+                unique_indices_list = unique_indices.cpu().numpy().tolist()
+                samples_to_remove = random.sample(unique_indices_list, min(num_to_remove, len(unique_indices_list)))
                 
                 print(f"Random filtering (no recommended weights available): removing {len(samples_to_remove)} batch positions from randomly selected samples: {samples_to_remove}")
         
@@ -1296,7 +1172,6 @@ class TransformerEncoderPretrain(L.LightningModule):
             
             # Return empty dict to indicate failure
             return {}
-
 
     def clear_per_example_gradients(self, keep_recent_steps=None):
         """Clear old per-example gradients to manage memory"""

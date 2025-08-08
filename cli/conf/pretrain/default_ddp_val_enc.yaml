@@ -42,7 +42,7 @@ trainer:
       every_n_epochs: ${floordiv:${trainer.max_epochs},10}
   # epoch-based training provides averaged metrics
   # cannot use max_steps with epoch-based training - resume from checkpoint on wrong epoch
-  max_epochs: 1_000
+  max_epochs: 1_000  # 1_000
   enable_progress_bar: true
   accumulate_grad_batches: 1
   gradient_clip_val: 1.0
@@ -53,10 +53,10 @@ trainer:
   num_sanity_val_steps: -1
 train_dataloader:
   _target_: tsfm.data.loader.DataLoader
-  batch_size: 32
+  batch_size: 32 # 32
   batch_size_factor: 2.0
   cycle: true
-  num_batches_per_epoch: 400
+  num_batches_per_epoch: 400 # 400
   shuffle: true
   num_workers: 11
   collate_fn:
@@ -73,7 +73,7 @@ train_dataloader:
 val_dataloader:
   _target_: torch.utils.data.DataLoader
   batch_size: 32
-  shuffle: true
+  shuffle: false
   num_workers: 11
   collate_fn:
     _target_: tsfm.data.loader.PadCollateWithDatasetIndex

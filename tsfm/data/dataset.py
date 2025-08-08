@@ -113,11 +113,14 @@ class TimeSeriesDatasetWithIndex(TimeSeriesDataset):
 
         # Get the data and add the GLOBAL dataset index metadata
         data = self._get_data(idx)
-        # For weighted datasets, each virtual sample gets a unique global index
-        # even if they map to the same physical time series
-        global_idx = self.global_offset + original_idx
+        # For weighted datasets, use the actual data index (bounded by num_ts) not the virtual index
+        # This ensures global_idx never exceeds the allocated range based on num_ts
+        actual_data_idx = idx % self.num_ts  # This matches what _get_data uses
+        global_idx = self.global_offset + actual_data_idx
+        if global_idx >= self.global_offset + self.num_ts:
+            print(f"Global idx {global_idx} exceeds allocated range [{self.global_offset} - {self.global_offset + self.num_ts}]")
         data['_dataset_idx'] = global_idx
-        # print(f"Original idx: {original_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
+        # print(f"Original idx: {original_idx}, Actual data idx: {actual_data_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
         return self.transform(self._flatten_data(data))
 
 
@@ -202,11 +205,14 @@ class MultiSampleTimeSeriesDatasetWithIndex(MultiSampleTimeSeriesDataset):
 
         # Get the data and add the GLOBAL dataset index metadata
         data = self._get_data(idx)
-        # For weighted datasets, each virtual sample gets a unique global index
-        # even if they map to the same physical time series
-        global_idx = self.global_offset + original_idx
+        # For weighted datasets, use the actual data index (bounded by num_ts) not the virtual index
+        # This ensures global_idx never exceeds the allocated range based on num_ts
+        actual_data_idx = idx % self.num_ts  # This matches what _get_data uses
+        global_idx = self.global_offset + actual_data_idx
+        if global_idx >= self.global_offset + self.num_ts:
+            print(f"Global idx {global_idx} exceeds allocated range [{self.global_offset} - {self.global_offset + self.num_ts}]")
         data['_dataset_idx'] = global_idx
-        # print(f"MultiSample - Original idx: {original_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
+        # print(f"Original idx: {original_idx}, Actual data idx: {actual_data_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
         return self.transform(self._flatten_data(data))
 
     def _flatten_data(
@@ -284,9 +290,10 @@ class EvalDatasetWithIndex(EvalDataset):
 
         # Get the data and add the GLOBAL dataset index metadata
         data = self._get_data(idx)
-        # For EvalDataset with weighting, each virtual sample gets a unique global index
-        # even if they map to the same physical time series across different windows
-        global_idx = self.global_offset + original_idx
+        # For EvalDataset, use the actual time series index (from divmod) not the virtual window index
+        # This ensures global_idx never exceeds the allocated range based on num_ts
+        window, actual_ts_idx = divmod(idx, self.num_ts)
+        global_idx = self.global_offset + actual_ts_idx
         data['_dataset_idx'] = global_idx
-        # print(f"Eval - Original idx: {original_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
+        # print(f"Eval - Original idx: {original_idx}, Window: {window}, Actual TS idx: {actual_ts_idx}, Global offset: {self.global_offset}, Global idx: {global_idx}")
         return self.transform(self._flatten_data(data))
