@@ -1,0 +1,14 @@
+- _target_: tsfm.data.builder.ConcatDatasetBuilderWithGlobalIndex
+  _args_:
+    - _target_: tsfm.data.builder.simple.SimpleEvalDatasetBuilder
+      dataset: ETTh1
+      offset: 11520
+      windows: 25.0
+      distance: 192
+      prediction_length: 192
+      context_length: 1000
+      patch_size: 32
+      storage_path: /mnt/storage/LSF
+      sample_time_series:
+        _target_: tsfm.data.dataset.SampleTimeSeriesType
+        _args_: ["proportional"]

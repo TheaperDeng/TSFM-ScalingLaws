@@ -33,3 +33,5 @@ enable_reweighting: false
 num_low_influence_to_remove: 16
 influence_filter_frequency: 1
 use_cosine_similarity: false
+generate_after_epoch: 30
+select_from_generated: false

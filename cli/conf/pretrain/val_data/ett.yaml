@@ -8,7 +8,7 @@
     #   prediction_length: 192
     #   context_length: 1000
     #   patch_size: 32
-    #   storage_path: /home/v-junweideng/online-ts-data-opt/TSFM-ScalingLaws/dataset_test/LSF
+    #   storage_path: /mnt/storage/LSF
     #   sample_time_series:
     #     _target_: tsfm.data.dataset.SampleTimeSeriesType
     #     _args_: ["proportional"]
@@ -20,7 +20,7 @@
     #   prediction_length: 192
     #   context_length: 1000
     #   patch_size: 32
-    #   storage_path: /home/v-junweideng/online-ts-data-opt/TSFM-ScalingLaws/dataset_test/LSF
+    #   storage_path: /mnt/storage/LSF
     #   sample_time_series:
     #     _target_: tsfm.data.dataset.SampleTimeSeriesType
     #     _args_: ["proportional"]
@@ -56,7 +56,7 @@
     #   prediction_length: 192
     #   context_length: 1000
     #   patch_size: 32
-    #   storage_path: /home/v-junweideng/online-ts-data-opt/TSFM-ScalingLaws/dataset_test/LSF
+    #   storage_path: /mnt/storage/LSF
     #   sample_time_series:
     #     _target_: tsfm.data.dataset.SampleTimeSeriesType
     #     _args_: ["proportional"]
@@ -68,7 +68,8 @@
       prediction_length: 192
       context_length: 1000
       patch_size: 32
-      storage_path: /home/v-junweideng/online-ts-data-opt/TSFM-ScalingLaws/dataset_test/LSF
+      # storage_path: /home/v-junweideng/online-ts-data-opt/TSFM-ScalingLaws/dataset_test/LSF
+      storage_path: /mnt/storage/LSF
       sample_time_series:
         _target_: tsfm.data.dataset.SampleTimeSeriesType
         _args_: ["proportional"]

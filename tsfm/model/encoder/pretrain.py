@@ -117,6 +117,8 @@ class TransformerEncoderPretrain(L.LightningModule):
         enable_reweighting: bool = False,
         influence_filter_frequency: int = 1,  # temporary
         use_cosine_similarity: bool = False,  # New parameter for cosine similarity
+        select_from_generated: bool = False,  # New parameter to select from generated samples
+        generate_after_epoch: int = 0,  # New parameter to start generation after certain epoch
     ):
         assert (module is not None) or (
             module_kwargs is not None
@@ -191,21 +193,40 @@ class TransformerEncoderPretrain(L.LightningModule):
         
         if use_influence_filtering:
             print(f"Step {current_step}: Using influence-based filtering (every {self.hparams.influence_filter_frequency} steps)")
-            batch = self._filter_low_influence_samples(
+            batch, threshold = self._filter_low_influence_samples(
                 batch, 
                 num_to_remove=self.hparams.num_low_influence_to_remove, 
                 use_influence_scores=True
             )
-            generated_batch = self._generated_similar_samples(batch)
+            # threshold = 0  # tmp
 
-            # merge the generated batch with the original batch
-            batch = self._merge_batches(batch, generated_batch)
+            if self.hparams.generate_after_epoch <= current_step:
+                generated_batch = self._generated_similar_samples(batch)
+                if self.hparams.select_from_generated:
+                    gen_grad = self._compute_per_sample_gradients_with_indices(generated_batch, generated_batch["_dataset_idx"])
+                    val_gradients = self.get_validation_gradients_from_trainer()
+                    # # calculate the influence score of the generated samples
+                    influence_scores_gen = self.compute_influence_scores_batched_on_generated(val_gradients, gen_grad)
 
-            # gen_grad = self._compute_per_sample_gradients_with_indices(generated_batch, generated_batch["_dataset_idx"])
-            # val_gradients = self.get_validation_gradients_from_trainer()
-            # print("Complete the gradient calculation of generated samples")
-            # # print("Type: {}, {}".format(type(val_gradients), type(gen_grad)))
-
+                    # Select only high-scoring generated samples (above threshold)
+                    keep_indices = [i for i, score in enumerate(influence_scores_gen) if score > threshold]
+                    print(f"Generated {len(influence_scores_gen)} samples, keeping {len(keep_indices)} samples above threshold {threshold}")
+                    
+                    # Filter generated batch to keep only high-scoring samples
+                    if keep_indices:
+                        filtered_generated_batch = {}
+                        for key, value in generated_batch.items():
+                            if torch.is_tensor(value) and value.shape[0] == len(influence_scores_gen):
+                                filtered_generated_batch[key] = value[keep_indices]
+                            else:
+                                filtered_generated_batch[key] = value
+                        batch = self._merge_batches(batch, filtered_generated_batch)
+                    else:
+                        print("No generated samples above threshold, skipping merge")
+                else:
+                    # Merge generated samples directly
+                    batch = self._merge_batches(batch, generated_batch)
+                    print(f"Step {current_step}: Merged generated samples, new batch size is {len(batch['dataset_index'])}")
         else:
             # Determine filtering strategy based on available recommended weights
             if hasattr(self, 'recommended_weights') and self.recommended_weights:
@@ -264,10 +285,11 @@ class TransformerEncoderPretrain(L.LightningModule):
 
         # load the model and datamodule for generation
         import sys
-        sys.path.append("/home/v-junweideng/online-ts-aug/TSFM-ScalingLaws/generation")
-        from generate_batch_preview import generate_conditional_batch, load_model
+        # sys.path.append("/home/v-junweideng/online-ts-aug/TSFM-ScalingLaws/generation")
+        from generation.generate_batch_preview import generate_conditional_batch, load_model
         if self.generation_model is None or self.generation_data is None:
-            ckpt_path = "/home/v-junweideng/online-ts-aug/TSFM-ScalingLaws/generation/000060-0.0853.ckpt"
+            # ckpt_path = "/home/v-junweideng/online-ts-aug/TSFM-ScalingLaws/generation/000060-0.0853.ckpt"
+            ckpt_path = "/mnt/storage/000060-0.0853.ckpt"
             generation_model, self.generation_data = load_model(ckpt_path, seed=0)
             object.__setattr__(self, 'generation_model', generation_model)
         
@@ -296,7 +318,7 @@ class TransformerEncoderPretrain(L.LightningModule):
             dataset_name=dataset_names_list,
             data_module=self.generation_data,
             num_samples=1,  # generation 1:1
-            ddim=False,
+            ddim=True,
             ddim_steps=40,
             dataset_idx=(-batch["_dataset_idx"]).tolist(),
         )
@@ -585,6 +607,8 @@ class TransformerEncoderPretrain(L.LightningModule):
                 
                 print(f"Influence-based filtering: removing {num_to_remove} batch positions from low-influence samples: {samples_to_remove}")
                 print(f"Average influence score: {sum(score for _, score in sample_scores) / len(sample_scores)}")
+                print(f"Median influence score: {sample_scores[len(sample_scores)//2][1]}")
+                threshold = sample_scores[len(sample_scores)//2][1]
                 print(f"Samples to remove average influence score: {sum(score for _, score in sample_scores[:num_to_remove]) / num_to_remove}")
         
         if not use_influence_scores:
@@ -693,7 +717,7 @@ class TransformerEncoderPretrain(L.LightningModule):
         
         print(f"Filtered batch size ({filter_type}): {original_batch_size} -> {new_batch_size} (actually removed {actual_removed} positions)")
         
-        return filtered_batch
+        return filtered_batch, threshold
     
     def _update_influence_score_history(self, influence_scores):
         """Update the influence score history for batch filtering"""
@@ -1052,6 +1076,86 @@ class TransformerEncoderPretrain(L.LightningModule):
             print(f"Error in batched influence computation: {e}")
             print("Falling back to original method...")
             return self.compute_influence_scores(val_gradients)
+    
+    def compute_influence_scores_batched_on_generated(self, val_gradients, gen_grad):
+        """Compute influence scores for generated samples using batched operations"""
+        if not val_gradients:
+            print("No validation gradients provided")
+            return {}
+        
+        if not gen_grad:
+            print("No generated gradients provided")
+            return {}
+        
+        # Pre-process validation gradients - get consistent parameter order
+        param_names = sorted([n for n in val_gradients.keys() if val_gradients[n] is not None])
+        if not param_names:
+            print("No valid validation gradients found")
+            return {}
+        
+        val_grad_flat = torch.cat([val_gradients[name].flatten() for name in param_names])
+        device = val_grad_flat.device
+        
+        # Collect generated gradients into batches
+        all_train_grads = []
+        
+        # Process generated gradients
+        for name in param_names:
+            if name in gen_grad and gen_grad[name] is not None:
+                # gen_grad[name] should be [num_generated_samples, param_shape...]
+                gen_grad_param = gen_grad[name]
+                if gen_grad_param.dim() > 1:
+                    # Flatten each sample's gradient for this parameter
+                    flattened_grads = gen_grad_param.view(gen_grad_param.shape[0], -1)
+                    if len(all_train_grads) == 0:
+                        # Initialize with the first parameter's gradients
+                        all_train_grads = [[] for _ in range(gen_grad_param.shape[0])]
+                    
+                    for i in range(gen_grad_param.shape[0]):
+                        all_train_grads[i].append(flattened_grads[i])
+                else:
+                    print(f"Warning: Unexpected gradient shape for {name}: {gen_grad_param.shape}")
+                    continue
+            else:
+                print(f"Warning: Parameter {name} not found in generated gradients")
+                return {}
+        
+        if not all_train_grads:
+            print("No valid generated gradients found for batch processing")
+            return {}
+        
+        # Concatenate gradients for each sample
+        try:
+            processed_grads = []
+            for sample_grads in all_train_grads:
+                if len(sample_grads) == len(param_names):
+                    sample_grad_flat = torch.cat(sample_grads)
+                    sample_grad_flat = sample_grad_flat.to(device)
+                    processed_grads.append(sample_grad_flat)
+            
+            if not processed_grads:
+                print("No valid processed gradients found")
+                return {}
+            
+            print(f"Batch processing influence scores for {len(processed_grads)} generated samples...")
+            
+            # Stack into matrix: [num_generated_samples, num_params]
+            train_grad_matrix = torch.stack(processed_grads)
+            
+            # Original dot product computation: [num_generated_samples]
+            influence_scores_flat = torch.matmul(train_grad_matrix, val_grad_flat)
+            
+            # Return the influence scores as a simple list or tensor
+            influence_scores_list = influence_scores_flat.detach().cpu().numpy().tolist()
+            
+            print(f"Successfully computed influence scores for {len(influence_scores_list)} generated samples")
+            print(f"Generated samples influence scores: {influence_scores_list}")
+            
+            return influence_scores_list
+            
+        except Exception as e:
+            print(f"Error in generated samples influence computation: {e}")
+            return {}
     
     def _get_dataset_name_for_index(self, global_idx: int) -> str:
         """Helper method to get dataset name for a global index."""
