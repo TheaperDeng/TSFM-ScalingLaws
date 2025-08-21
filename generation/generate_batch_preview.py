@@ -7,6 +7,7 @@ from typing import Union, List
 
 # Add TimeCraft/TimeDP to path
 sys.path.append("/scratch/amlt_code/TimeCraft/TimeDP")
+# sys.path.append("../TimeCraft/TimeDP")
 
 
 def generate_conditional_batch(
