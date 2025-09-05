@@ -11,7 +11,6 @@ from torch.distributions import Distribution
 import math
 import time
 import numpy as np
-import random
 
 from tsfm.loss.packed import (
     PackedDistributionLoss,
@@ -116,8 +115,7 @@ class TransformerEncoderPretrain(L.LightningModule):
         enable_influence_scoring: bool = False,
         enable_dataset_contribution_logging: bool = False,
         enable_reweighting: bool = False,
-        # influence_filter_frequency: int = 1,  # temporary
-        influence_filter_ratio: float = 0.7,
+        influence_filter_frequency: int = 1,  # temporary
         use_cosine_similarity: bool = False,  # New parameter for cosine similarity
         select_from_generated: bool = False,  # New parameter to select from generated samples
         generate_after_epoch: int = 0,  # New parameter to start generation after certain epoch
@@ -188,20 +186,13 @@ class TransformerEncoderPretrain(L.LightningModule):
     ) -> torch.Tensor:
         # Determine whether to use influence-based or random filtering
         current_step = self.global_step
-        # use_influence_filtering = (current_step % self.hparams.influence_filter_frequency == 0) and self.hparams.enable_influence_scoring
-        if self.hparams.enable_influence_scoring:
-            # set use_influence_filtering = 1 by influence_filter_ratio possibility
-            use_influence_filtering = random.random() < self.hparams.influence_filter_ratio
-            if self.global_step == 0:
-                use_influence_filtering = True
-        else:
-            use_influence_filtering = False
+        use_influence_filtering = (current_step % self.hparams.influence_filter_frequency == 0) and self.hparams.enable_influence_scoring
         
         # Always apply some form of filtering (influence-based every N steps, random otherwise)
         print(f"Step {current_step}: This batch originally has {len(batch['dataset_index'])} samples")
         
         if use_influence_filtering:
-            print(f"Step {current_step}: Using influence-based filtering (p={self.hparams.influence_filter_ratio} steps)")
+            print(f"Step {current_step}: Using influence-based filtering (every {self.hparams.influence_filter_frequency} steps)")
             batch, threshold = self._filter_low_influence_samples(
                 batch, 
                 num_to_remove=self.hparams.num_low_influence_to_remove, 
@@ -243,16 +234,11 @@ class TransformerEncoderPretrain(L.LightningModule):
             else:
                 print(f"Step {current_step}: Using random filtering (no recommended weights available yet)")
             
-            batch, threshold = self._filter_low_influence_samples(
+            batch = self._filter_low_influence_samples(
                 batch, 
                 num_to_remove=self.hparams.num_low_influence_to_remove, 
                 use_influence_scores=False
             )
-
-            generated_batch = self._generated_similar_samples(batch)
-            batch = self._merge_batches(batch, generated_batch)
-            print(f"Step {current_step}: Merged generated samples, new batch size is {len(batch['dataset_index'])}")
-
         
         print(f"Step {current_step}: This batch after filtering has {len(batch['dataset_index'])} samples")
 
@@ -425,15 +411,7 @@ class TransformerEncoderPretrain(L.LightningModule):
         
         # Only compute influence scores when influence-based filtering will be used
         current_step = self.global_step
-        # use_influence_filtering = (current_step % self.hparams.influence_filter_frequency == 0)
-        if self.hparams.enable_influence_scoring:
-            # set use_influence_filtering = 1 by influence_filter_ratio possibility
-            use_influence_filtering = random.random() < self.hparams.influence_filter_ratio
-            if self.global_step == 0:
-                use_influence_filtering = True
-        else:
-            use_influence_filtering = False
-        
+        use_influence_filtering = (current_step % self.hparams.influence_filter_frequency == 0)
         
         if not use_influence_filtering:
             print(f"Step {current_step}: Skipping influence computation (random filtering step)")
@@ -602,7 +580,6 @@ class TransformerEncoderPretrain(L.LightningModule):
             print(f"Batch has only {len(unique_indices)} unique samples, not removing any")
             return batch
         
-        threshold = 0
         if use_influence_scores:
             # Use influence-based filtering (original behavior)
             if not self.hparams.enable_influence_scoring:

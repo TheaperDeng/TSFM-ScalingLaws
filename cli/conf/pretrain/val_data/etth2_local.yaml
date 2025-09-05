@@ -1,7 +1,7 @@
 - _target_: tsfm.data.builder.ConcatDatasetBuilderWithGlobalIndex
   _args_:
     - _target_: tsfm.data.builder.simple.SimpleEvalDatasetBuilder
-      dataset: ETTh1
+      dataset: ETTh2
       offset: 11520
       windows: 25.0
       distance: 192
@@ -12,11 +12,10 @@
       sample_time_series:
         _target_: tsfm.data.dataset.SampleTimeSeriesType
         _args_: ["proportional"]
-
 - _target_: tsfm.data.builder.ConcatDatasetBuilderWithGlobalIndex
   _args_:
     - _target_: tsfm.data.builder.simple.SimpleEvalDatasetBuilder
-      dataset: ETTh1
+      dataset: ETTh2
       offset: 11520
       windows: 25.0
       distance: 96
@@ -27,11 +26,10 @@
       sample_time_series:
         _target_: tsfm.data.dataset.SampleTimeSeriesType
         _args_: ["proportional"]
-
 - _target_: tsfm.data.builder.ConcatDatasetBuilderWithGlobalIndex
   _args_:
     - _target_: tsfm.data.builder.simple.SimpleEvalDatasetBuilder
-      dataset: ETTh1
+      dataset: ETTh2
       offset: 11520
       windows: 25.0
       distance: 336
@@ -42,11 +40,10 @@
       sample_time_series:
         _target_: tsfm.data.dataset.SampleTimeSeriesType
         _args_: ["proportional"]
-
 - _target_: tsfm.data.builder.ConcatDatasetBuilderWithGlobalIndex
   _args_:
     - _target_: tsfm.data.builder.simple.SimpleEvalDatasetBuilder
-      dataset: ETTh1
+      dataset: ETTh2
       offset: 11520
       windows: 25.0
       distance: 720

@@ -1,6 +1,7 @@
 hydra:
   run:
-    dir: outputs/pretrain/${hydra:runtime.choices.model}/${hydra:runtime.choices.data}/${run_name}
+    # dir: outputs/pretrain/${hydra:runtime.choices.model}/${hydra:runtime.choices.data}/${run_name}
+    dir: /work/nvme/bffl/oats/outputs/pretrain/${hydra:runtime.choices.model}/${hydra:runtime.choices.data}/${run_name}
 defaults:
   - model: ???
   - data: ???
@@ -26,13 +27,13 @@ trainer:
   callbacks:
     - _target_: lightning.pytorch.callbacks.LearningRateMonitor
       logging_interval: epoch
-    - _target_: lightning.pytorch.callbacks.ModelCheckpoint
-      dirpath: ${hydra:runtime.output_dir}/checkpoints
-      filename: last
-      monitor: epoch
-      mode: max
-      save_top_k: 1
-      every_n_epochs: 10
+    # - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    #   dirpath: ${hydra:runtime.output_dir}/checkpoints
+    #   filename: last
+    #   monitor: epoch
+    #   mode: max
+    #   save_top_k: 1
+    #   every_n_epochs: 10
     - _target_: lightning.pytorch.callbacks.ModelCheckpoint
       dirpath: ${hydra:runtime.output_dir}/checkpoints
       monitor: epoch
@@ -42,7 +43,7 @@ trainer:
       every_n_epochs: ${floordiv:${trainer.max_epochs},10}
   # epoch-based training provides averaged metrics
   # cannot use max_steps with epoch-based training - resume from checkpoint on wrong epoch
-  max_epochs: 1_000  # 1_000
+  max_epochs: 100  # 1_000
   enable_progress_bar: true
   accumulate_grad_batches: 1
   gradient_clip_val: 1.0
@@ -77,7 +78,7 @@ val_dataloader:
   num_workers: 11
   collate_fn:
     _target_: tsfm.data.loader.PadCollateWithDatasetIndex
-    max_length: 48
+    max_length: 60  # 48
     seq_fields: ${cls_getattr:${model._target_},seq_fields}
     pad_func_map: ${cls_getattr:${model._target_},pad_func_map}
   pin_memory: false

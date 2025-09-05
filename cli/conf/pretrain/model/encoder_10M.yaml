@@ -28,10 +28,11 @@ beta2: 0.98
 num_training_steps: ${mul:${trainer.max_epochs},${train_dataloader.num_batches_per_epoch}}
 num_warmup_steps: 10_000  # 10_000
 enable_influence_scoring: true  # Set to false to disable influence scoring
-enable_dataset_contribution_logging: false
-enable_reweighting: false 
+enable_dataset_contribution_logging: true
+enable_reweighting: true 
 num_low_influence_to_remove: 16
-influence_filter_frequency: 1
+# influence_filter_frequency: 1
+influence_filter_ratio: 0.7
 use_cosine_similarity: false
 generate_after_epoch: 30
 select_from_generated: false
